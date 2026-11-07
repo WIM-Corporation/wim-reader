@@ -107,7 +107,8 @@ def db():
     c.row_factory = sqlite3.Row
     c.executescript(SCHEMA)
     have = {r[1] for r in c.execute("PRAGMA table_info(docs)")}
-    for col, typ in (("content_hash", "TEXT"), ("hash_mtime", "REAL"), ("revised_at", "REAL")):
+    for col, typ in (("content_hash", "TEXT"), ("hash_mtime", "REAL"), ("revised_at", "REAL"), ("creator_session", "TEXT"), ("creator_cwd", "TEXT"),
+                     ("creator_n", "INTEGER"), ("creator_mtime", "REAL"), ("ask_session", "TEXT")):
         if col not in have:
             c.execute(f"ALTER TABLE docs ADD COLUMN {col} {typ}")
     return c
@@ -520,7 +521,16 @@ def deep_card(b, emit):
         prompt = f"{base}\n\n문서 본문(이 용어가 나온 절 주변):\n{doc}\n\n이번 갈래: {label}\n할 일: {task}" if key in ("doc", "base") \
             else f"{base}\n\n이번 갈래: {label}\n할 일: {task}"
         try:
-            out = explain_run(prompt, DEEP_MODEL, w, system=LANE_SYS, tools=tools, timeout=300)
+            info = creator(b.get("k", "")) if key == "doc" and b.get("k") else None
+            if info:
+                emit({"e": "lane", "id": key, "label": "이 문서(만든 세션)", "st": "run"})
+                _, out, er = session_run(["--resume", info["sid"], "--fork-session", "--no-session-persistence", "--tools", "Read,Grep,Glob",
+                                          "--setting-sources", "", "--permission-mode", "bypassPermissions"],
+                                         f"{prompt}\n\n{LANE_SYS}\n이 문서를 네가 만들었다. 만들 때 쓴 근거 자료(_raw 등)와 판단 이유까지 조사 메모에 넣는다. 파일은 고치지 않는다.",
+                                         info["cwd"] or str(ROOT), w, timeout=300)
+                out = out if out and not er else explain_run(prompt, DEEP_MODEL, w, system=LANE_SYS, tools=tools, timeout=300)
+            else:
+                out = explain_run(prompt, DEEP_MODEL, w, system=LANE_SYS, tools=tools, timeout=300)
         except Exception as e:  # noqa: BLE001 — 갈래 하나가 죽어도 나머지로 간다
             out = None; emit({"e": "lane", "id": key, "st": "fail", "msg": str(e)[:200]})
         if out:
@@ -665,6 +675,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.json({"items": merged(c), "marks": [dict(r) for r in c.execute("SELECT * FROM marks ORDER BY created_at DESC")]})
         if u.path == "/__reader/mermaid.js":
             return self.send(mermaid_js(), "text/javascript; charset=utf-8", cache="max-age=604800")
+        if u.path == "/__reader/api/session":  # 이 문서를 만든 Claude Code 세션(폴더 안 파일을 가장 최근에 여러 번 고친 세션)
+            if not self.local():
+                return self.json({"error": "이 컴퓨터에서만"}, 403)
+            info = creator(nfc(q.get("k", "")).strip("/"), refresh=bool(q.get("refresh")))
+            return self.json(info or {"sid": None})
         if u.path == "/__reader/api/explains":  # 왼쪽 아래 기록 버튼: 지금까지 만든 카드(용어·문서별 최신 1개)
             c = db()
             if q.get("id"):
@@ -711,6 +726,8 @@ class Handler(BaseHTTPRequestHandler):
                 b["k"] = nfc(b["k"]).strip("/")
             if path == "/__reader/api/explain":
                 return self.explain(b)
+            if path == "/__reader/api/ask":
+                return self.ask(b)
             fn = {"/__reader/api/doc": save_doc, "/__reader/api/mark": save_mark, "/__reader/api/done": save_done}.get(path)
             if not fn:
                 return self.send_error(404)
@@ -816,6 +833,263 @@ def _deep_handler(self, b):
 
 
 Handler.explain_deep = _deep_handler
+
+
+# ---------- 만든 세션에 묻기·고치기: 문서를 만든 Claude Code 세션을 이어받아(--resume --fork-session) 묻거나 HTML을 고친다 ----------
+PROJECTS = Path.home() / ".claude/projects"
+ASK_JOBS, ASK_LK, SESS_LK = {}, threading.Lock(), {}
+TOOL_ARG = ("file_path", "command", "pattern", "url", "query", "path", "description", "prompt")
+
+
+def _slug(p):
+    return re.sub(r"[^A-Za-z0-9]", "-", str(p))
+
+
+def _sess_cwd(f):
+    try:
+        with open(f, errors="ignore") as fh:
+            for i, ln in enumerate(fh):
+                if '"cwd"' in ln:
+                    try:
+                        return json.loads(ln).get("cwd")
+                    except ValueError:
+                        pass
+                if i > 400:
+                    break
+    except OSError:
+        pass
+    return None
+
+
+_RG = []
+
+
+def _rg():
+    """rg 실행 파일. 없으면 Claude Code에 든 rg(claude 바이너리를 argv0=rg로)를 쓴다."""
+    if not _RG:
+        exe = shutil.which("rg") or next((x for x in ("/opt/homebrew/bin/rg", "/usr/local/bin/rg", "/usr/bin/rg") if Path(x).exists()), None)
+        if not exe and Path(CLAUDE).exists():
+            try:
+                c = os.path.realpath(CLAUDE)
+                if subprocess.run(["rg", "--version"], executable=c, capture_output=True, text=True, timeout=10).stdout.startswith("ripgrep"):
+                    exe = c
+            except (OSError, subprocess.SubprocessError):
+                pass
+        _RG.append(exe)
+    return _RG[0]
+
+
+def find_creator(key):
+    """문서가 든 폴더 안 파일을 file_path로 고친(Write·Edit) 세션을 세션 기록(jsonl)에서 찾는다. 서브에이전트 기록은 부모 세션으로 친다.
+    3번 이상 고친 세션 중 가장 최근 것, 없으면 가장 많이 고친 것."""
+    p = resolve(key)[0]
+    if p is None:
+        return None
+    seg = nfc(p.parent.name) if p.parent != ROOT else nfc(p.name)
+    pats = {re.escape(x) for x in (seg, unicodedata.normalize("NFD", seg), json.dumps(seg)[1:-1])}
+    home = PROJECTS / _slug(ROOT)
+    dirs = [home] if home.is_dir() else ([d for d in PROJECTS.iterdir() if d.is_dir()] if PROJECTS.is_dir() else [])
+    if not dirs:
+        return None
+    rx = ['"file_path":"[^"]*/' + x + '/' for x in pats]
+    lines, exe = [], _rg()
+    if exe:
+        r = subprocess.run(["rg", "-c", "--no-messages", "-g", "*.jsonl", *sum((["-e", x] for x in rx), []), *map(str, dirs)],
+                           executable=exe, capture_output=True, text=True, timeout=120)
+        lines = [ln.rsplit(":", 1) for ln in r.stdout.splitlines() if ":" in ln]
+    else:  # rg가 없으면 글자 그대로 먼저 거르고 걸린 파일만 정규식으로 센다
+        cre = re.compile("|".join(rx).encode())
+        lits = [("/" + x + "/").encode() for x in (seg, unicodedata.normalize("NFD", seg), json.dumps(seg)[1:-1])]
+        for d in dirs:
+            for f in d.rglob("*.jsonl"):
+                try:
+                    data = f.read_bytes()
+                except OSError:
+                    continue
+                if any(x in data for x in lits):
+                    n = len(cre.findall(data))
+                    if n:
+                        lines.append((str(f), str(n)))
+    cnt, main = {}, {}
+    for f, n in lines:
+        fp = Path(f)
+        if fp.parent.name == "subagents":
+            sid, m = fp.parent.parent.name, fp.parent.parent.parent / f"{fp.parent.parent.name}.jsonl"
+        else:
+            sid, m = fp.stem, fp
+        cnt[sid] = cnt.get(sid, 0) + int(n); main[sid] = m
+    cands = [(sid, n, main[sid].stat().st_mtime) for sid, n in cnt.items() if main[sid].exists()]
+    if not cands:
+        return None
+    many = [c for c in cands if c[1] >= 3]
+    sid, n, mt = max(many, key=lambda c: c[2]) if many else max(cands, key=lambda c: (c[1], c[2]))
+    return {"sid": sid, "n": n, "mtime": mt, "cwd": _sess_cwd(main[sid]) or str(ROOT)}
+
+
+def creator(key, refresh=False):
+    """만든 세션 정보(캐시). 못 찾으면 None. fork = 리더에서 이어 묻는 갈래 세션."""
+    if not key:
+        return None
+    c = db()
+    r = c.execute("SELECT creator_session, creator_cwd, creator_n, creator_mtime, ask_session FROM docs WHERE key=?", (key,)).fetchone()
+    if r and r[0] is not None and not refresh:
+        return {"sid": r[0], "cwd": r[1], "n": r[2], "mtime": r[3], "fork": r[4]} if r[0] else None
+    info = find_creator(key)
+    with LOCK, c:
+        if not r:
+            c.execute("INSERT OR IGNORE INTO docs(key) VALUES(?)", (key,))
+        c.execute("UPDATE docs SET creator_session=?, creator_cwd=?, creator_n=?, creator_mtime=?, ask_session=NULL WHERE key=?",
+                  (info["sid"] if info else "", info and info["cwd"], info and info["n"], info and info["mtime"], key))
+    return dict(info, fork=None) if info else None
+
+
+def session_run(extra, prompt, cwd, on_text, on_tool=None, timeout=900):
+    """claude -p를 cwd에서 돌린다(이어받기 인자는 extra). (새 세션 id, 답, 오류)를 돌려준다."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDECODE", "CLAUDE_CODE_"))}
+    proc = subprocess.Popen([CLAUDE, "-p", "--model", DEEP_MODEL, "--output-format", "stream-json", "--verbose", "--include-partial-messages", *extra, prompt],
+                            cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    timer = threading.Timer(timeout, proc.kill); timer.start()
+    sid, out, err = None, [], ""
+    try:
+        for ln in proc.stdout:
+            try:
+                ev = json.loads(ln)
+            except ValueError:
+                continue
+            t = ev.get("type")
+            if t == "system" and ev.get("subtype") == "init":
+                sid = ev.get("session_id")
+            elif t == "stream_event":
+                e = ev.get("event") or {}
+                if e.get("type") == "content_block_delta" and e.get("delta", {}).get("type") == "text_delta":
+                    out.append(e["delta"]["text"]); on_text(e["delta"]["text"])
+            elif t == "assistant" and on_tool:
+                for blk in (ev.get("message") or {}).get("content") or []:
+                    if blk.get("type") == "tool_use":
+                        if out and not out[-1].endswith("\n\n"):  # 도구를 쓰고 이어 쓰는 글이 앞 글에 붙지 않게
+                            out.append("\n\n"); on_text("\n\n")
+                        inp = blk.get("input") or {}
+                        arg = next((str(inp[k]) for k in TOOL_ARG if inp.get(k)), "")
+                        on_tool(blk.get("name", ""), arg.replace(str(ROOT) + "/", "")[:160])
+            elif t == "result":
+                sid = ev.get("session_id") or sid
+                if ev.get("is_error"):
+                    err = str(ev.get("result") or "오류")[:300]
+        proc.wait()
+        if not out and not err and proc.returncode:
+            err = (proc.stderr.read() or "").strip()[-300:] or f"claude 종료 코드 {proc.returncode}"
+    finally:
+        timer.cancel()
+        if proc.poll() is None:
+            proc.kill()
+    return sid, "".join(out), err
+
+
+ASK_RULE = {
+    "ask": "규칙: 이 문서를 만든 맥락과 근거 자료를 바탕으로 한국어로 답한다. 확인이 필요하면 파일을 읽어도 되지만 어떤 파일도 고치지 않는다. "
+           "고른 부분과 이어서, 짧은 문단과 목록으로 10~15줄 안에서 답한다. 모르는 것은 모른다고 쓴다.",
+    "edit": "규칙: 이 HTML을 사용자 요청대로 고친다. 빌드 원본(_build/pages 조각 등)이 있으면 원본을 고치고 그 폴더의 원래 빌드 명령으로 다시 만든다. "
+            "출력 _local.html만 손으로 고치지 않는다. 다른 문서·폴더는 건드리지 않는다. 끝나면 무엇을 바꿨는지 3줄 이내로 한국어로 답한다.",
+}
+
+
+def _ask_run(b, push):
+    k, mode = b["k"], ("edit" if b.get("mode") == "edit" else "ask")
+    lk = SESS_LK.setdefault(k, threading.Lock())
+    if lk.locked():
+        push({"e": "note", "msg": "이 문서에 먼저 보낸 요청이 끝나길 기다리는 중"})
+    with lk:
+        t0, info = time.time(), creator(k)
+        p = resolve(k)[0]
+        mt0 = p.stat().st_mtime if p else 0
+        prompt = "\n".join([f"[WIM Reader에서 보낸 {'질문' if mode == 'ask' else 'HTML 수정 요청'}]", f"문서: {p or k}",
+                             f"절: {b.get('head', '')[:200]}", f"사용자가 고른 부분: «{(b.get('sel') or '')[:2000]}»",
+                             f"주변 글: «{(b.get('ctx') or '')[:1500]}»", "", b["q"].strip()[:4000], "", ASK_RULE[mode]])
+        tools = (["--tools", "Read,Grep,Glob,WebSearch,WebFetch", "--setting-sources", ""] if mode == "ask" else []) + ["--permission-mode", "bypassPermissions"]
+        for attempt in range(2):
+            fork, cwd = (info or {}).get("fork"), (info or {}).get("cwd") or str(ROOT)
+            if fork and (PROJECTS / _slug(cwd) / f"{fork}.jsonl").exists():
+                how, res = "cont", ["--resume", fork]
+            elif info:
+                how, res = "fork", ["--resume", info["sid"], "--fork-session"]
+            else:
+                how, res, cwd = "new", [], str(ROOT)
+            push({"e": "meta", "how": how, "sid": info and info["sid"], "n": info and info["n"], "mtime": info and info["mtime"], "mode": mode})
+            sid, out, err = session_run(res + tools, prompt, cwd, lambda t: push({"e": "text", "d": t}),
+                                        lambda n, a: push({"e": "tool", "name": n, "arg": a}), timeout=900 if mode == "edit" else 600)
+            if err and how == "cont" and not out and attempt == 0:  # 이어 묻던 갈래가 사라졌으면 만든 세션에서 다시 갈라 시작
+                c = db()
+                with LOCK, c:
+                    c.execute("UPDATE docs SET ask_session=NULL WHERE key=?", (k,))
+                info["fork"] = None
+                continue
+            break
+        if sid and how in ("fork", "new") and not err:
+            c = db()
+            with LOCK, c:
+                if how == "new":
+                    c.execute("UPDATE docs SET creator_session=?, creator_cwd=?, creator_n=0, creator_mtime=? WHERE key=?", (sid, cwd, time.time(), k))
+                else:
+                    c.execute("UPDATE docs SET ask_session=? WHERE key=?", (sid, k))
+        changed = bool(p and p.exists() and p.stat().st_mtime != mt0)
+        if err and not out:
+            return push({"e": "err", "msg": err})
+        push({"e": "done", "changed": changed, "sec": round(time.time() - t0), "how": how, "err": err})
+
+
+def _ask_handler(self, b):
+    if not self.local():  # 파일을 고칠 수 있는 경로라 LAN에는 열지 않는다
+        return self.json({"error": "질문·수정은 이 컴퓨터에서만 됩니다"}, 403)
+    if not b.get("k") or not (b.get("q") or "").strip():
+        return self.json({"error": "질문이 비었습니다"}, 400)
+    jid = re.sub(r"[^A-Za-z0-9_-]", "", str(b.get("id") or ""))[:64] or pysecrets.token_hex(8)
+    with ASK_LK:
+        job = ASK_JOBS.get(jid)
+        attach = bool(job)
+        if not job and not b.get("resume_only"):
+            job = ASK_JOBS[jid] = {"evs": [], "done": False, "cv": threading.Condition()}
+
+            def push(ev, job=job):
+                with job["cv"]:
+                    job["evs"].append(ev); job["cv"].notify_all()
+
+            def run(job=job, push=push):
+                try:
+                    _ask_run(b, push)
+                except Exception as e:  # noqa: BLE001
+                    push({"e": "err", "msg": str(e)[:300]})
+                finally:
+                    with job["cv"]:
+                        job["done"] = True; job["cv"].notify_all()
+                    threading.Timer(600, lambda: ASK_JOBS.pop(jid, None)).start()  # 끝난 뒤 10분은 다시 붙을 수 있게 남긴다
+            threading.Thread(target=run, daemon=True).start()
+    self.send_response(200)
+    self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+    self.send_header("Cache-Control", "no-store")
+    self.send_header("X-Ask", "attach" if attach else "live")
+    self.end_headers()
+
+    def emit(ev):
+        self.wfile.write((json.dumps(ev, ensure_ascii=False) + "\n").encode()); self.wfile.flush()
+    try:
+        if not job:  # 서버가 재시작돼 작업이 사라졌다. 수정 요청을 두 번 돌리지 않도록 새로 시작하지 않는다
+            return emit({"e": "err", "msg": "서버가 재시작돼 요청이 끊겼습니다. 결과를 확인하고 필요하면 다시 보내 주세요"})
+        i = 0
+        while True:
+            with job["cv"]:
+                while i >= len(job["evs"]) and not job["done"]:
+                    job["cv"].wait(15)
+                evs, fin = job["evs"][i:], job["done"]
+            i += len(evs)
+            for ev in evs:
+                emit(ev)
+            if fin and i >= len(job["evs"]):
+                break
+    except (BrokenPipeError, ConnectionResetError, OSError):
+        pass
+
+
+Handler.ask = _ask_handler
 
 
 def inject(raw):
@@ -1176,8 +1450,42 @@ TRACKER_JS = r"""
     .mk{display:flex;gap:8px;align-items:flex-start;padding:6px 0;border-top:1px solid var(--ln);cursor:pointer}
     .mk span:first-child{min-width:36px;color:var(--ac);font-weight:600}.mk .x{margin-left:auto;color:var(--mu);border:0;padding:0 4px}
     a{color:var(--ac)}[hidden]{display:none!important}
-    .chip{position:fixed;background:var(--ac);color:#fff;border:0;border-radius:14px;padding:3px 10px;font-size:12px;font-weight:600;
-      box-shadow:0 2px 10px #0003;cursor:pointer}
+    .chip{position:fixed;display:flex;align-items:center;background:var(--ac);border-radius:14px;padding:2px;box-shadow:0 2px 10px #0003}
+    .chip button{background:none;border:0;color:#fff;font-size:12px;font-weight:700;padding:3px 10px;border-radius:12px;cursor:pointer}
+    .chip button:hover{background:#fff3}.chip button+button:not([hidden]){box-shadow:inset 1px 0 #fff6}
+    .ask{position:fixed;width:min(620px,calc(100vw - 24px));max-height:min(72vh,680px);display:flex;flex-direction:column;
+      --k-bg:#f7f6f2;--k-paper:#fff;--k-ink:#1d2330;--k-muted:#5b6475;--k-line:#d9dce3;--k-acc:#1f5fbf;--k-acc-soft:#e3edfb;--k-box:#eef1f6;--k-ok:#2c8a55;--k-warn:#c43d3d;
+      --k-font:"Pretendard","Apple SD Gothic Neo","Noto Sans KR",system-ui,sans-serif;
+      background:var(--k-paper);color:var(--k-ink);border:1px solid var(--k-line);border-radius:14px;box-shadow:0 18px 50px #0006;overflow:hidden}
+    .ask,.ask *{font-family:var(--k-font)}
+    .ask header{display:flex;align-items:center;gap:8px;padding:9px 12px;border-bottom:1px solid var(--k-line);background:var(--k-box);cursor:default}
+    .ask header b{font-size:13.5px;white-space:nowrap}.ask header small{flex:1;min-width:0;font-size:11.5px;color:var(--k-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .ask button{color:var(--k-ink);border-color:var(--k-line);background:var(--k-paper);font-size:12.5px}
+    .ask .x{border:0;background:none;font-size:20px;line-height:1;padding:0 4px;color:var(--k-muted)}
+    .ask .qs{margin:10px 12px 0;padding:6px 10px;border-left:4px solid #f5b301;background:color-mix(in srgb,#f5b301 14%,transparent);border-radius:6px;
+      font-size:13px;line-height:1.5;max-height:4.8em;overflow:auto;white-space:pre-wrap}
+    .ask .qs b{font-size:11px;color:var(--k-muted);margin-right:6px}
+    .ask .th{flex:1;min-height:0;overflow:auto;padding:2px 14px 8px;overscroll-behavior:contain;user-select:text;-webkit-user-select:text}.ask .th:empty{display:none}
+    .ask .tq{margin:12px 0 4px;font-weight:700;font-size:14px;line-height:1.5}
+    .ask .tq i{font-style:normal;font-size:11px;padding:1px 7px;border-radius:6px;background:var(--k-acc-soft);color:var(--k-acc);margin-right:6px;vertical-align:1px}
+    .ask .tq i.ed{background:color-mix(in srgb,var(--k-warn) 16%,transparent);color:var(--k-warn)}
+    .ask .tl,.card .tl{font:11.5px/1.5 ui-monospace,Menlo,monospace;color:var(--k-muted);margin:1px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .ask .ta *{font-size:14.5px;line-height:1.65}.ask .ta p{margin:6px 0}.ask .ta ul,.ask .ta ol{margin:4px 0 8px;padding-left:1.3em}
+    .ask .ta h2{font-size:15px;margin:10px 0 4px}.ask .ta h2 .n{display:none}.ask .ta code{font-family:ui-monospace,Menlo,monospace;font-size:13px;background:var(--k-box);padding:1px 4px;border-radius:4px}
+    .ask .ta a{color:var(--k-acc)}.ask .ta table{border-collapse:collapse;margin:6px 0}.ask .ta td,.ask .ta th{border:1px solid var(--k-line);padding:4px 8px;font-size:13px}
+    .ask .cur::after{content:'▍';color:var(--k-acc);animation:bl 1s steps(2) infinite}
+    .ask .ok{margin:8px 0;padding:8px 10px;border-radius:8px;background:color-mix(in srgb,var(--k-ok) 16%,transparent);font-size:13.5px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+    .ask .ok button{background:var(--k-ok);border-color:var(--k-ok);color:#fff;font-weight:700}
+    .ask form{border-top:1px solid var(--k-line);padding:10px 12px;display:flex;flex-direction:column;gap:8px;background:var(--k-paper)}
+    .ask textarea{width:100%;resize:vertical;min-height:54px;max-height:30vh;background:var(--k-bg);color:var(--k-ink);border:1px solid var(--k-line);border-radius:9px;padding:8px 10px;font-size:14px;line-height:1.5}
+    .ask textarea:focus{outline:2px solid color-mix(in srgb,var(--k-acc) 50%,transparent);border-color:var(--k-acc)}
+    .ask .row2{display:flex;align-items:center;gap:8px}.ask .hint{flex:1;font-size:11.5px;color:var(--k-muted)}
+    .ask .seg{display:inline-flex;border:1px solid var(--k-line);border-radius:8px;overflow:hidden}
+    .ask .seg button{border:0;border-radius:0;padding:5px 11px;color:var(--k-muted);background:none}
+    .ask .seg button.on{background:var(--k-acc);color:var(--k-paper);font-weight:700}.ask .seg button[data-m="edit"].on{background:var(--k-warn)}
+    .ask button.p{background:var(--k-acc);border-color:var(--k-acc);color:var(--k-paper);font-weight:700;padding:5px 14px}
+    .ask.edit button.p{background:var(--k-warn);border-color:var(--k-warn)}.ask button:disabled{opacity:.6}
+    .card .q small{font-size:12px;color:var(--k-muted);font-weight:600}
     .ov{position:fixed;inset:0;background:#0009;display:flex;align-items:center;justify-content:center;padding:3vh 3vw 46px}
     .dock{position:fixed;right:62px;left:62px;bottom:0;display:flex;flex-direction:row-reverse;gap:6px;overflow-x:auto;scrollbar-width:none;pointer-events:none}
     .dock .tb{pointer-events:auto;flex:0 0 auto;display:flex;align-items:center;gap:7px;max-width:240px;height:38px;padding:0 4px 0 12px;background:var(--bg);color:var(--fg);
@@ -1308,7 +1616,11 @@ TRACKER_JS = r"""
   <div class="dock" hidden></div>
   <button class="hb" title="설명 카드 기록 — 지금까지 만든 카드 다시 열기">카드</button>
   <div class="hp" hidden><header><b>설명 카드 기록</b> <span class="mu cnt"></span><input placeholder="용어·문서 검색"></header><div class="ls"></div></div>
-  <button class="chip" hidden>설명</button>
+  <div class="chip" hidden><button data-c="e" title="개념 카드 (e)">설명</button><button data-c="a" title="이 문서를 만든 세션에 질문·수정 요청 (a)">질문·수정</button></div>
+  <div class="ask" hidden><header><b>만든 세션에 묻기</b><small class="si"></small><button class="x" data-q="x" title="닫기 (Esc) · 진행 중인 요청은 계속됨">×</button></header>
+    <div class="qs"></div><div class="th"></div>
+    <form><textarea rows="2"></textarea><div class="row2"><span class="seg"><button type="button" data-m="ask" class="on">질문</button><button type="button" data-m="edit">HTML 수정</button></span>
+      <span class="hint">Enter 보내기 · Shift+Enter 줄바꿈</span><button class="p" type="submit">보내기</button></div></form></div>
   <button class="fab" title="읽기 기록 (b 책갈피 · m 메모 · [ ] 이동 · d 읽음 · 단어 선택 후 e 설명)">0%</button>`;
   const $ = s => R.querySelector(s);
   const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c]));
@@ -1419,8 +1731,8 @@ TRACKER_JS = r"""
       'acc-soft': rgb(mix(acc, paper, .84)), box: rgb(mix(ink, paper, .94)), code: rgb(mix(ink, paper, .9)), wim: rgb(wim), 'wim-soft': rgb(mix(wim, paper, .85)),
       ok: rgb(D ? [92, 194, 138] : [44, 138, 85]), warn: rgb(D ? [239, 123, 123] : [196, 61, 61]), amber: rgb(D ? [227, 169, 79] : [170, 110, 20])};
     c.removeAttribute('style');
-    for (const [k, v] of Object.entries(KT)) if (k !== 'dark') c.style.setProperty('--k-' + k, v);
-    if (bs.fontFamily && !/^(-apple-system|system-ui|sans-serif)/.test(bs.fontFamily)) c.style.setProperty('--k-font', bs.fontFamily);
+    for (const [k, v] of Object.entries(KT)) if (k !== 'dark') { c.style.setProperty('--k-' + k, v); $('.ask').style.setProperty('--k-' + k, v); }
+    if (bs.fontFamily && !/^(-apple-system|system-ui|sans-serif)/.test(bs.fontFamily)) { c.style.setProperty('--k-font', bs.fontFamily); $('.ask').style.setProperty('--k-font', bs.fontFamily); }
   };
   const dark = () => KT.dark ?? matchMedia('(prefers-color-scheme: dark)').matches;
   const kv = n => getComputedStyle($('.card')).getPropertyValue('--k-' + n).trim();
@@ -1466,7 +1778,7 @@ TRACKER_JS = r"""
     return out; };
   const toTop = (rect, doc) => { let x = 0, y = 0;  // iframe 안 좌표 → 바깥 화면 좌표(칩은 바깥에 있다)
     for (let w = doc.defaultView; w?.frameElement; w = w.parent) { const f = w.frameElement, b = f.getBoundingClientRect(); x += b.left + f.clientLeft; y += b.top + f.clientTop; }
-    return {top: rect.top + y, bottom: rect.bottom + y, right: rect.right + x}; };
+    return {top: rect.top + y, bottom: rect.bottom + y, right: rect.right + x, left: rect.left + x}; };
   // 심층 카드에 보낼 문서 본문: 고른 곳을 감싸는 절(없으면 3,000자 넘을 때까지 위로), 그림 라벨은 ' · '로 잇고 7,000자 창으로 자른다
   const docText = (blk, node, term) => {
     const body = blk.ownerDocument.body; let root = blk.closest('section,article');
@@ -1478,7 +1790,7 @@ TRACKER_JS = r"""
     if (out.length <= 7000) return out.trim(); const c = at >= 0 ? at : Math.max(0, out.indexOf(term)); return out.slice(Math.max(0, c - 3500), c + 3500).trim(); };
   const readPick = (doc = document) => {
     const sel = doc.getSelection(); if (!sel || sel.isCollapsed || !sel.rangeCount) return null;
-    const term = sel.toString().replace(/\s+/g, ' ').trim(); if (!term || term.length > 80) return null;
+    const term = sel.toString().replace(/\s+/g, ' ').trim(); if (!term || term.length > 3000) return null;  // 80자 넘으면 질문만
     const r = sel.getRangeAt(0), n = r.commonAncestorContainer, el = n.nodeType === 1 ? n : n.parentElement;
     if (!el || el.closest('#__wim_reader')) return null;
     const sv = el.closest('svg');
@@ -1497,13 +1809,14 @@ TRACKER_JS = r"""
       ctx = clip((row ? row.innerText : blk.innerText) || '', term, 1200);
       const th = blk.closest('table')?.querySelector('tr'); if (row && th && th !== row) ctx = '표 머리: ' + clip(th.innerText, '', 300) + ' / 행: ' + ctx;
     }
-    return {term, ctx, head: headOf(blk), rect: toTop(r.getBoundingClientRect(), doc), odoc: doc, doc: docText(blk, r.startContainer, term)};
+    return {term, ctx, head: headOf(blk), rect: toTop(r.getBoundingClientRect(), doc), odoc: doc, doc: docText(blk, r.startContainer, term), range: r.cloneRange()};
   };
   const anyPick = () => { for (const d of allDocs()) { const p = readPick(d); if (p) return p; } return null; };
   let st;
   const onSel = () => { clearTimeout(st); st = setTimeout(() => {
     pick = innerPick() || anyPick(); const c = $('.chip');
     if (!pick) { c.hidden = true; return; }
+    c.querySelector('[data-c="e"]').hidden = pick.term.length > 80;
     c.hidden = false; const w = c.offsetWidth || 44;
     c.style.left = Math.min(innerWidth - w - 8, Math.max(8, pick.rect.right - w / 2)) + 'px';
     c.style.top = (pick.rect.bottom + 34 > innerHeight ? pick.rect.top - 30 : pick.rect.bottom + 6) + 'px';
@@ -1654,7 +1967,7 @@ TRACKER_JS = r"""
     saveDock(); paintDock();
   }
   const explain = p => {
-    if (!p) return; $('.chip').hidden = true;
+    if (!p) return; if (p.term.length > 80) return openAsk(p); $('.chip').hidden = true;
     try { p.odoc?.getSelection().removeAllRanges(); getSelection().removeAllRanges(); R.getSelection?.()?.removeAllRanges(); } catch {}
     const doc = p.inner ? X?.doc : p.doc;
     if (p.inner && X) hist.push(X); else if (!p.inner) hist.length = 0;
@@ -1691,12 +2004,117 @@ TRACKER_JS = r"""
   $('.hp input').addEventListener('input', () => { clearTimeout(hpT); hpT = setTimeout(loadHist, 200); });
   $('.hp').addEventListener('keydown', e => { e.stopPropagation(); if (e.key === 'Escape') { $('.hp').hidden = true; $('.hb').classList.remove('on'); } });
   $('.hp .ls').addEventListener('click', e => { const b = e.target.closest('.it'); if (b) fromHist(b.dataset.id); });
+  // ---------- 만든 세션에 묻기·고치기: 고른 곳 위·아래에 입력창을 띄워 이 HTML을 만든 Claude Code 세션에 묻거나 고치게 한다 ----------
+  const SIC = {}, TOOLK = {Read: '읽기', Grep: '찾기', Glob: '파일 목록', Edit: '고치기', MultiEdit: '고치기', Write: '쓰기', Bash: '실행', WebSearch: '웹 검색',
+    WebFetch: '웹 읽기', Task: '에이전트', Agent: '에이전트', TodoWrite: '할 일', Skill: '스킬'};
+  const sessOf = (k, refresh) => (!refresh && SIC[k]) ? Promise.resolve(SIC[k]) :
+    fetch(API + 'session?k=' + encodeURIComponent(k) + (refresh ? '&refresh=1' : '')).then(r => r.ok ? r.json() : {error: 1}).then(j => SIC[k] = j).catch(() => ({error: 1}));
+  const dstr = t => { const d = new Date(t * 1000); return `${d.getMonth() + 1}/${d.getDate()}`; };
+  const sessLabel = si => !si ? '세션 찾는 중…' : si.error ? '이 컴퓨터에서만 쓸 수 있습니다' : si.sid
+    ? `세션 ${si.sid.slice(0, 8)} · ${dstr(si.mtime)}${si.n ? ` · 이 폴더 ${si.n}번 수정` : ''}${si.fork ? ' · 이어서 묻는 중' : ''}` : '만든 세션을 못 찾음 → 새 세션으로 묻습니다';
+  // 요청은 서버에서 따로 돈다. 연결이 끊기면 같은 id로 다시 붙는다(수정 요청이 두 번 돌지 않게 resume_only)
+  async function askStream(b, h) {
+    const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    for (let n = 0; n < 40; n++) {
+      let fin = false;
+      try {
+        const r = await fetch(API + 'ask', {method: 'POST', body: JSON.stringify({k: K, ...b, id, resume_only: n > 0})});
+        if (!r.ok) { let m = '요청 거절'; try { m = (await r.json()).error || m; } catch {} h.err(m); return; }
+        h.reset?.();
+        const rd = r.body.getReader(), dec = new TextDecoder(); let buf = '';
+        for (;;) { const {done, value} = await rd.read(); if (done) break; buf += dec.decode(value, {stream: true});
+          for (let i; (i = buf.indexOf('\n')) >= 0;) { const ln = buf.slice(0, i); buf = buf.slice(i + 1); let ev; try { ev = JSON.parse(ln); } catch { continue; }
+            if (ev.e === 'done') { fin = true; h.done(ev); } else if (ev.e === 'err') { fin = true; h.err(ev.msg); } else h[ev.e]?.(ev); } }
+      } catch {}
+      if (fin) return;
+      h.note?.({msg: '연결 끊김 · 다시 붙는 중'}); await new Promise(ok => setTimeout(ok, Math.min(2000 + n * 1000, 8000)));
+    }
+    h.err('서버와 연결이 계속 끊깁니다');
+  }
+  let AQ = null, AM = 'ask', abusy = false;
+  const AP = {ask: '예: 그럼 지금 하드웨어는 USB로 연결된 건가? USB 대기는 뭐지?', edit: '예: 이 그림 아래에 USB 대기가 무엇인지 한 문단 추가해줘'};
+  const setMode = m => { AM = m; const a = $('.ask'); a.classList.toggle('edit', m === 'edit');
+    a.querySelectorAll('[data-m]').forEach(b => b.classList.toggle('on', b.dataset.m === m)); a.querySelector('textarea').placeholder = AP[m]; };
+  const placeAsk = () => { const a = $('.ask'); if (a.hidden) return;
+    const w = a.offsetWidth, h = a.offsetHeight; let r = null;
+    try { if (AQ?.range) { const b = AQ.range.getBoundingClientRect(); if (b.width || b.height) r = toTop(b, AQ.doc); } } catch {}
+    let x, y;
+    if (!r) { a.style.maxHeight = ''; x = (innerWidth - w) / 2; y = innerHeight - a.offsetHeight - 56; }
+    else { x = Math.min(innerWidth - w - 12, Math.max(12, r.left));
+      // 고른 곳을 가리지 않게: 위·아래 중 넓은 쪽에 두고 그 칸에 맞춰 높이를 줄인다(최소 260px)
+      const below = innerHeight - r.bottom - 60, above = r.top - 20, down = below >= above, room = Math.max(260, (down ? below : above));
+      a.style.maxHeight = Math.min(room, innerHeight * 0.72, 680) + 'px'; const h2 = a.offsetHeight;
+      y = down ? r.bottom + 10 : r.top - h2 - 10;
+      y = Math.min(innerHeight - h2 - 50, Math.max(10, y)); }  // 고른 곳이 화면 밖으로 가면 가장자리에 붙는다
+    a.style.left = Math.max(12, x) + 'px'; a.style.top = Math.max(10, y) + 'px'; };
+  const saveAsk = open => { try { sessionStorage.setItem('wimask:' + K, JSON.stringify({th: $('.ask .th').innerHTML, sel: AQ?.sel, ctx: AQ?.ctx, head: AQ?.head, mode: AM, open})); } catch {} };
+  const openAsk = p => {
+    if (!p) return; $('.chip').hidden = true;
+    AQ = {range: p.range || null, doc: p.odoc || document, sel: p.term, ctx: p.ctx, head: p.head};
+    try { p.odoc?.getSelection().removeAllRanges(); getSelection().removeAllRanges(); R.getSelection?.()?.removeAllRanges(); } catch {}
+    theme(); const a = $('.ask'); a.hidden = false;
+    a.querySelector('.qs').innerHTML = '<b>고른 부분</b>' + esc(p.term.length > 600 ? p.term.slice(0, 600) + '…' : p.term);
+    a.querySelector('.si').textContent = sessLabel(SIC[K]);
+    sessOf(K).then(si => a.querySelector('.si').textContent = sessLabel(si));
+    setMode(AM); placeAsk(); a.querySelector('textarea').focus();
+  };
+  const closeAsk = () => { $('.ask').hidden = true; saveAsk(false); };
+  const sendAsk = async () => {
+    const a = $('.ask'), t = a.querySelector('textarea'), q = t.value.trim(); if (!q || abusy) return;
+    abusy = true; t.value = ''; const mode = AM, btn = a.querySelector('button.p'); btn.disabled = true; btn.textContent = '처리 중…';
+    const th = a.querySelector('.th'), item = document.createElement('div');
+    item.innerHTML = `<div class="tq"><i class="${mode === 'edit' ? 'ed' : ''}">${mode === 'edit' ? 'HTML 수정' : '질문'}</i>${esc(q)}</div><div class="tls"></div><div class="ta cur"></div>`;
+    th.append(item); th.scrollTop = th.scrollHeight; placeAsk();
+    const tls = item.querySelector('.tls'), ta = item.querySelector('.ta'); let txt = '';
+    const line = m => { tls.insertAdjacentHTML('beforeend', `<div class="tl">${esc(m)}</div>`); th.scrollTop = th.scrollHeight; };
+    await askStream({sel: AQ?.sel || '', ctx: AQ?.ctx || '', head: AQ?.head || '', q, mode}, {
+      reset: () => { txt = ''; tls.innerHTML = ''; ta.innerHTML = ''; },
+      meta: ev => { line(ev.how === 'cont' ? '같은 대화에 이어서 묻는 중…' : ev.how === 'fork' ? `만든 세션 ${String(ev.sid).slice(0, 8)}을 이어받아 묻는 중… (첫 질문은 맥락을 불러오느라 조금 걸림)` : '만든 세션을 못 찾아 새 세션으로 묻는 중…'); },
+      tool: ev => line(`${TOOLK[ev.name] || ev.name} · ${ev.arg || ''}`),
+      note: ev => line(ev.msg),
+      text: ev => { txt += ev.d; ta.innerHTML = md(txt); th.scrollTop = th.scrollHeight; placeAsk(); },
+      done: ev => { ta.classList.remove('cur'); if (!txt) ta.innerHTML = '';
+        if (ev.changed) item.insertAdjacentHTML('beforeend', `<div class="ok">HTML이 고쳐졌습니다 · ${ev.sec}초<button type="button" data-q="reload">새로고침해서 보기</button></div>`);
+        else if (mode === 'edit') line('파일 변화 없음'); else line(`${ev.sec}초`); },
+      err: m => { ta.classList.remove('cur'); ta.innerHTML = md(txt) + `<p style="color:var(--k-warn)">[실패] ${esc(m)}</p>`; }
+    });
+    abusy = false; btn.disabled = false; btn.textContent = '보내기'; saveAsk(!a.hidden); placeAsk();
+    delete SIC[K]; sessOf(K).then(si => a.querySelector('.si').textContent = sessLabel(si));
+  };
+  $('.ask form').addEventListener('submit', e => { e.preventDefault(); sendAsk(); });
+  $('.ask').addEventListener('keydown', e => { e.stopPropagation();
+    if (e.key === 'Escape') closeAsk();
+    else if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.target.tagName === 'TEXTAREA') { e.preventDefault(); sendAsk(); } });
+  $('.ask').addEventListener('click', e => { const q = e.target.closest('[data-q]')?.dataset.q, m = e.target.closest('[data-m]')?.dataset.m;
+    if (m) setMode(m);
+    else if (q === 'x') closeAsk();
+    else if (q === 'reload') { try { sessionStorage.setItem('wimgo', JSON.stringify({a: anchor(), r: ratio()})); } catch {} saveAsk(true); location.reload(); } });
+  addEventListener('scroll', () => placeAsk(), {passive: true, capture: true}); addEventListener('resize', () => placeAsk());
+  const restoreAsk = () => { try { const v = JSON.parse(sessionStorage.getItem('wimask:' + K) || 'null'); if (!v?.open) return;
+    AQ = {range: null, doc: document, sel: v.sel, ctx: v.ctx, head: v.head}; theme(); const a = $('.ask'); a.hidden = false;
+    a.querySelector('.qs').innerHTML = '<b>고른 부분</b>' + esc(v.sel || ''); a.querySelector('.th').innerHTML = v.th || ''; a.querySelector('.ok button')?.remove();
+    setMode(v.mode || 'ask'); sessOf(K).then(si => a.querySelector('.si').textContent = sessLabel(si)); placeAsk(); a.querySelector('.th').scrollTop = 1e9; } catch {} };
+  // 개념 카드의 '더 물어보기'도 만든 세션이 있으면 그 세션에 묻는다
+  async function askCard(S, q) {
+    setBusy(S, true, '만든 세션이 답하는 중…'); setTag(S, '만든 세션에 묻는 중');
+    const sec = document.createElement('section'), box = document.createElement('div');
+    sec.innerHTML = `<div class="q">↳ ${esc(q)} <small>· 만든 세션</small></div><div class="tls"></div>`; box.className = 'cur'; sec.append(box); S.bd.append(sec);
+    if (X === S) sec.scrollIntoView({block: 'start', behavior: 'smooth'});
+    const tls = sec.querySelector('.tls'); let txt = '';
+    await askStream({k: S.k, sel: S.term, ctx: S.ctx, head: S.head, mode: 'ask', q: `개념 카드 '${S.term}'을 보다가 묻는다: ${q}`}, {
+      reset: () => { txt = ''; tls.innerHTML = ''; box.innerHTML = ''; },
+      tool: ev => tls.insertAdjacentHTML('beforeend', `<div class="tl">${esc(TOOLK[ev.name] || ev.name)} · ${esc(ev.arg || '')}</div>`),
+      text: ev => { txt += ev.d; box.innerHTML = md(txt); fillMM(box); },
+      done: () => {}, err: m => { txt += `\n\n[실패] ${m}`; box.innerHTML = md(txt); } });
+    box.className = ''; S.last = (S.last ? S.last + '\n' : '') + txt; setTag(S, ''); setBusy(S, false);
+  }
   try { JSON.parse(localStorage.getItem(DK) || '[]').forEach(x => { const S = session(x); SS.push(S); if (x.st === 'run') run(S); }); } catch {}
   paintDock();
   $('.chip').addEventListener('mousedown', e => e.preventDefault());  // 선택이 풀리지 않게
-  $('.chip').addEventListener('click', () => explain(pick || anyPick()));
+  $('.chip').addEventListener('click', e => { const c = e.target.closest('[data-c]')?.dataset.c, p = pick || anyPick(); if (c === 'a') openAsk(p); else if (c) explain(p); });
   $('.card form').addEventListener('submit', e => { e.preventDefault(); const i = $('.card input'), q = i.value.trim();
-    if (!q || !X || X.busy) return; i.value = ''; ask(X, {term: X.term, ctx: X.ctx, head: X.head, q, prev: X.last}, '↳ ' + q); });
+    if (!q || !X || X.busy) return; i.value = ''; const S0 = X;
+    sessOf(S0.k).then(si => si?.sid ? askCard(S0, q) : ask(S0, {term: S0.term, ctx: S0.ctx, head: S0.head, q, prev: S0.last}, '↳ ' + q)); });
   const escCard = () => { const lb = $('.card .lb'); if (!lb.hidden) lb.hidden = true; else minimize(); };
   $('.card').addEventListener('keydown', e => { e.stopPropagation(); if (e.key === 'Escape') escCard();
     else if (e.key === 'f' && !e.metaKey && !e.ctrlKey && !/^(INPUT|TEXTAREA)$/.test((e.composedPath()[0] || e.target).tagName)) { e.preventDefault(); setFull(!FULL, true); } });  // 페이지 단축키로 새지 않게
@@ -1748,7 +2166,7 @@ TRACKER_JS = r"""
     if (e.metaKey || e.ctrlKey || e.altKey || e.isComposing) return;
     const t = e.composedPath()[0] || e.target; if (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)) return;
     if (e.key === 'f' && !$('.ov').hidden) { e.preventDefault(); return setFull(!FULL, true); }
-    const f = {e: () => explain(anyPick()), b: () => addMark(false), m: () => addMark(true), d: toggleDone, '[': () => jumpMark(-1), ']': () => jumpMark(1)}[e.key];
+    const f = {a: () => openAsk(anyPick()), e: () => explain(anyPick()), b: () => addMark(false), m: () => addMark(true), d: toggleDone, '[': () => jumpMark(-1), ']': () => jumpMark(1)}[e.key];
     if (f) { e.preventDefault(); f(); }
   };
   addEventListener('keydown', onKey);
@@ -1781,7 +2199,9 @@ TRACKER_JS = r"""
     take(j);
     const h = location.hash.match(/^#__rm=(\d+)$/), prev = D;
     const revised = prev && prev.revised_at && prev.revised_at > (prev.last_open || 0);
-    if (h) { const m = M.find(x => x.id == h[1]); if (m) goTo(JSON.parse(m.anchor || 'null'), m.ratio); }
+    let go = null; try { go = JSON.parse(sessionStorage.getItem('wimgo') || 'null'); sessionStorage.removeItem('wimgo'); } catch {}
+    if (go) { goTo(go.a, go.r); setTimeout(() => { if (!userMoved) goTo(go.a, go.r); }, 900); toast('고친 문서를 다시 불러왔습니다', 3000); }
+    else if (h) { const m = M.find(x => x.id == h[1]); if (m) goTo(JSON.parse(m.anchor || 'null'), m.ratio); }
     else if (prev && prev.cur_ratio > 0.02 && !location.hash) {
       const a = JSON.parse(prev.cur_anchor || 'null');
       goTo(a, prev.cur_ratio);
@@ -1790,6 +2210,7 @@ TRACKER_JS = r"""
     }
     if (revised) setTimeout(() => toast('문서가 고쳐져 읽음 표시를 초기화했습니다', 5000), h || prev.cur_ratio > 0.02 ? 6200 : 300);
     setTimeout(() => { restored = true; }, 1200);
+    restoreAsk();
     post('doc', body({open: true, title: document.title})).then(take).catch(() => {});
   }
   if (document.readyState === 'complete') start(); else addEventListener('load', start);

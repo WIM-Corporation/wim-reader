@@ -520,7 +520,7 @@ def deep_card(b, emit):
         prompt = f"{base}\n\n문서 본문(이 용어가 나온 절 주변):\n{doc}\n\n이번 갈래: {label}\n할 일: {task}" if key in ("doc", "base") \
             else f"{base}\n\n이번 갈래: {label}\n할 일: {task}"
         try:
-            out = explain_run(prompt, DEEP_MODEL, w, system=LANE_SYS, tools=tools, timeout=170)
+            out = explain_run(prompt, DEEP_MODEL, w, system=LANE_SYS, tools=tools, timeout=300)
         except Exception as e:  # noqa: BLE001 — 갈래 하나가 죽어도 나머지로 간다
             out = None; emit({"e": "lane", "id": key, "st": "fail", "msg": str(e)[:200]})
         if out:
@@ -537,12 +537,12 @@ def deep_card(b, emit):
     miss = [lab for k, lab, _, _ in LANES if k not in notes]
     emit({"e": "stage", "st": "write", "sec": round(time.time() - t0)})
     syn = f"{base}\n\n문서 본문:\n{doc}\n\n{memo}" + (f"\n\n(실패한 조사 갈래: {', '.join(miss)})" if miss else "")
-    card = explain_run(syn, DEEP_MODEL, lambda t: emit({"e": "syn", "d": t}), system=CARD_SYS, timeout=240)
+    card = explain_run(syn, DEEP_MODEL, lambda t: emit({"e": "syn", "d": t}), system=CARD_SYS, timeout=480)
     if not card:
         emit({"e": "err", "msg": "카드 쓰기에 실패했습니다"}); return None
     emit({"e": "stage", "st": "verify", "sec": round(time.time() - t0)})
     vr = explain_run(f"{base}\n\n문서 본문:\n{doc}\n\n{memo}\n\n### 검증할 카드 초안\n{card}", DEEP_MODEL, lambda t: None,
-                     system=VERIFY_SYS, timeout=150) or ""
+                     system=VERIFY_SYS, timeout=300) or ""
     final, checks = apply_checks(card, vr)
     if miss:
         final += f"- 조사 갈래 실패: {', '.join(miss)}\n"
@@ -1193,6 +1193,9 @@ TRACKER_JS = r"""
     .dock .dx{border:0;padding:2px 6px;color:inherit;opacity:.55;font-size:16px;line-height:1}.dock .dx:hover{opacity:1}
     @keyframes spin{to{transform:rotate(360deg)}}@keyframes pop{50%{transform:translateY(-4px)}}
     .toast.up{bottom:52px}
+    .card .failbox{display:flex;flex-wrap:wrap;align-items:center;gap:10px 14px;margin:6px 0 16px;padding:14px 18px;border-radius:12px;border:1px solid var(--k-warn);border-left-width:5px;background:var(--k-box)}
+    .card .failbox b{font-size:15px}.card .failbox span{flex:1 1 260px;font-size:13.5px;color:var(--k-muted)}
+    .card .failbox button{background:var(--k-acc);border-color:var(--k-acc);color:var(--k-paper);font-weight:700;padding:6px 14px}
     .ov.full{padding:0 0 42px;background:#000d}
     .ov.full .card{width:100%;height:100%;max-height:100%;border-radius:0;border:0;box-shadow:none}
     .ov.full .card .sc{padding:34px max(40px,calc((100% - 1180px) / 2)) 80px}
@@ -1532,7 +1535,7 @@ TRACKER_JS = r"""
     c.querySelector('[data-x="back"]').hidden = !hist.length; c.querySelector('.tag').textContent = S.tag;
     const i = c.querySelector('input'); i.disabled = S.busy; i.placeholder = S.ph;
     c.querySelector('.lb').hidden = true; $('.ov').hidden = false; sc.scrollTop = S.top || 0;
-    if (S.st === 'idle') run(S);
+    if (S.st === 'idle' || S.st === 'fail') run(S);  // 실패한 카드는 누르면 다시 만든다
     $('.ov').classList.toggle('full', FULL); toc();
     paintDock();
   };
@@ -1598,32 +1601,50 @@ TRACKER_JS = r"""
     S.st = 'run'; S.t0 = Date.now(); S.unseen = false; saveDock(); paintDock();
     setBusy(S, true, '카드 만드는 중… ▾ 내리고 계속 읽어도 됩니다');
     box.className = 'cur'; bd.append(box);
-    const L = {}, t0 = S.t0; let acc = '', stage = '조사 중', fin = null, cache = false, stat = null, how = [];
+    const L = {}, t0 = S.t0; let acc = '', stage = '조사 중', fin = null, cache = false, stat = null, how = [], failMsg = '';
     const imgs = s => { if (!gal.dataset.done) { const m = s.match(/^IMG:(.*)\n/m); if (m) { gal.dataset.done = 1; loadImgs(m[1], gal); } } };
     const paint = () => { if (cache) return; pg.hidden = false;
       pg.innerHTML = Object.values(L).map(v => `<div class="${v.st}"><b>조사 · ${esc(v.label || '')}</b><small>${v.st === 'done' ? `${(v.n || 0).toLocaleString()}자 · 링크 ${v.src || 0} · ${v.sec}초` : v.st === 'fail' ? '실패(나머지로 진행)' : `${(v.n || 0).toLocaleString()}자`}</small></div>`).join('')
-        + `<div class="${fin ? 'done' : 'run'}"><b>${esc(stage)}</b><small>${[fin ? '' : Math.round((Date.now() - t0) / 1000) + '초', stat ? `검증 ${stat.checks}건 · 수정 ${stat.fixed}건` : ''].filter(Boolean).join(' · ')}</small></div>`; };
+        + `<div class="${fin ? 'done' : failMsg ? 'fail' : 'run'}"><b>${esc(stage)}</b><small>${[fin || failMsg ? '' : Math.round((Date.now() - t0) / 1000) + '초', failMsg, stat ? `검증 ${stat.checks}건 · 수정 ${stat.fixed}건` : ''].filter(Boolean).join(' · ')}</small></div>`; };
     const tick = setInterval(paint, 1000);
     setTag(S, '조사 4갈래 → 카드 → 검증');
-    try {
-      const r = await fetch(API + 'explain', {method: 'POST', signal: my.signal,
-        body: JSON.stringify({k: S.k, title: S.title, v: 3, term: S.term, ctx: S.ctx, head: S.head, doc: S.doc, fresh: !!fresh})});
-      how = (r.headers.get('X-Explain') || '').split(' ');
-      if (how[0] === 'attach') setTag(S, '만들던 카드에 다시 붙음 · 조사 → 카드 → 검증');
-      const rd = r.body.getReader(), dec = new TextDecoder(); let buf = '';
-      for (;;) { const {done, value} = await rd.read(); if (done) break; buf += dec.decode(value, {stream: true});
-        for (let i; (i = buf.indexOf('\n')) >= 0;) { const ln = buf.slice(0, i); buf = buf.slice(i + 1); let ev; try { ev = JSON.parse(ln); } catch { continue; }
-          if (ev.e === 'lane') L[ev.id] = {...(L[ev.id] || {}), ...ev};
-          else if (ev.e === 'stage') stage = ev.st === 'write' ? '카드 쓰는 중 (초안)' : '검증 중 (초안 대조)';
-          else if (ev.e === 'syn') { acc += ev.d; imgs(acc); box.innerHTML = md(acc); fillMM(box); }
-          else if (ev.e === 'final') { fin = ev.card; cache = !!ev.cache; stat = ev.stat || null; stage = cache ? '저장된 카드' : `끝 · ${ev.sec}초`; }
-          else if (ev.e === 'err') { acc += '\n\n[실패] ' + ev.msg; box.innerHTML = md(acc); }
-        }
-        paint(); }
-    } catch (e) { acc += e.name === 'AbortError' ? '\n(중단됨)' : '\n[연결 실패] 리더 서버를 확인하세요'; box.innerHTML = md(acc); }
+    // 연결이 끊기면(서버 재시작·와이파이·절전) 실패로 끝내지 않고 다시 붙는다. 서버에 만들던 카드가 있으면 이어 받고,
+    // 없으면(재시작으로 사라짐) 새로 만든다. 서버가 '실패'를 보낸 경우만 멈추고 다시 시도 버튼을 보인다
+    let err = null;
+    for (let n = 0; ; n++) {
+      for (const k in L) delete L[k];
+      acc = ''; box.innerHTML = ''; err = null;
+      try {
+        const r = await fetch(API + 'explain', {method: 'POST', signal: my.signal,
+          body: JSON.stringify({k: S.k, title: S.title, v: 3, term: S.term, ctx: S.ctx, head: S.head, doc: S.doc, fresh: !!fresh && n === 0})});
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        how = (r.headers.get('X-Explain') || '').split(' ');
+        stage = '조사 중';
+        if (how[0] === 'attach') setTag(S, '만들던 카드에 다시 붙음 · 조사 → 카드 → 검증');
+        else if (n) setTag(S, '다시 연결됨 · 조사 → 카드 → 검증');
+        const rd = r.body.getReader(), dec = new TextDecoder(); let buf = '';
+        for (;;) { const {done, value} = await rd.read(); if (done) break; buf += dec.decode(value, {stream: true});
+          for (let i; (i = buf.indexOf('\n')) >= 0;) { const ln = buf.slice(0, i); buf = buf.slice(i + 1); let ev; try { ev = JSON.parse(ln); } catch { continue; }
+            if (ev.e === 'lane') L[ev.id] = {...(L[ev.id] || {}), ...ev};
+            else if (ev.e === 'stage') stage = ev.st === 'write' ? '카드 쓰는 중 (초안)' : '검증 중 (초안 대조)';
+            else if (ev.e === 'syn') { acc += ev.d; imgs(acc); box.innerHTML = md(acc); fillMM(box); }
+            else if (ev.e === 'final') { fin = ev.card; cache = !!ev.cache; stat = ev.stat || null; stage = cache ? '저장된 카드' : `끝 · ${ev.sec}초`; }
+            else if (ev.e === 'err') err = ev.msg || '알 수 없는 오류';
+          }
+          paint(); }
+      } catch (e) { if (e.name === 'AbortError' || my !== S.ctl) { clearInterval(tick); return; } }
+      if (fin || err) break;
+      if (n >= 30) { err = '서버와 연결이 계속 끊깁니다. 리더 서버를 확인하세요'; break; }
+      const w = Math.min(2 + n * 2, 10);
+      for (let t = w; t > 0; t--) { stage = `연결 끊김 · ${t}초 뒤 다시 붙음 (${n + 1}번째)`; paint(); await new Promise(ok => setTimeout(ok, 1000)); if (my !== S.ctl) { clearInterval(tick); return; } }
+      stage = '다시 연결 중…'; paint();
+    }
+    if (err) { stage = '실패'; failMsg = err; }
     clearInterval(tick);
     if (my !== S.ctl) return;
     if (fin) { imgs(fin); box.innerHTML = md(fin); fillMM(box); acc = fin; }
+    else { const f = document.createElement('div'); f.className = 'failbox';
+      f.innerHTML = `<b>카드를 끝까지 못 만들었습니다</b><span>${esc(failMsg)}</span><button data-x="re">다시 시도</button>`; box.after(f); }
     box.className = ''; paint(); if (cache) pg.hidden = true;
     if (!gal.dataset.done) gal.innerHTML = '';
     S.last = acc; S.st = fin ? 'done' : 'fail';

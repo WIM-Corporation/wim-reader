@@ -469,7 +469,8 @@ JSON 하나만 출력한다(코드 블록 없이). 형식:
 
 
 def deep_hash(b):
-    raw = json.dumps([b["term"][:80], b.get("ctx", "")[:1500], (b.get("doc") or "")[:200], DEEP_MODEL, "deep4"], ensure_ascii=False)
+    sess = bool(b.get("k") and creator(b["k"]))
+    raw = json.dumps([b["term"][:80], b.get("ctx", "")[:1500], (b.get("doc") or "")[:200], DEEP_MODEL, "deep5s" if sess else "deep4"], ensure_ascii=False)
     return hashlib.sha1(raw.encode()).hexdigest()
 
 
@@ -525,8 +526,8 @@ def deep_card(b, emit):
             if info:
                 emit({"e": "lane", "id": key, "label": "이 문서(만든 세션)", "st": "run"})
                 _, out, er = session_run(["--resume", info["sid"], "--fork-session", "--no-session-persistence", "--tools", "Read,Grep,Glob",
-                                          "--setting-sources", "", "--permission-mode", "bypassPermissions"],
-                                         f"{prompt}\n\n{LANE_SYS}\n이 문서를 네가 만들었다. 만들 때 쓴 근거 자료(_raw 등)와 판단 이유까지 조사 메모에 넣는다. 파일은 고치지 않는다.",
+                                          "--setting-sources", "", "--permission-mode", "bypassPermissions", "--append-system-prompt", LANE_SYS],
+                                         f"{prompt}\n\n이 문서를 네가 만들었다. 만들 때 쓴 근거 자료(_raw 등)와 판단 이유까지 조사 메모에 넣는다. 파일은 고치지 않는다.",
                                          info["cwd"] or str(ROOT), w, timeout=300)
                 out = out if out and not er else explain_run(prompt, DEEP_MODEL, w, system=LANE_SYS, tools=tools, timeout=300)
             else:
@@ -547,7 +548,23 @@ def deep_card(b, emit):
     miss = [lab for k, lab, _, _ in LANES if k not in notes]
     emit({"e": "stage", "st": "write", "sec": round(time.time() - t0)})
     syn = f"{base}\n\n문서 본문:\n{doc}\n\n{memo}" + (f"\n\n(실패한 조사 갈래: {', '.join(miss)})" if miss else "")
-    card = explain_run(syn, DEEP_MODEL, lambda t: emit({"e": "syn", "d": t}), system=CARD_SYS, timeout=480)
+    info = creator(b.get("k", "")) if b.get("k") else None
+    card = None
+    if info:  # 이 문서를 만든 세션이 카드를 쓴다: 만들 때 본 근거·숫자·판단 맥락이 카드에 들어간다
+        emit({"e": "stage", "st": "write", "who": "session", "sec": round(time.time() - t0)})
+        _, card, er = session_run(["--resume", info["sid"], "--fork-session", "--no-session-persistence", "--tools", "Read,Grep,Glob",
+                                   "--setting-sources", "", "--permission-mode", "bypassPermissions", "--append-system-prompt", CARD_SYS],
+                                  syn + "\n\n이 문서는 네가 만들었다. 만들 때 쓴 근거 자료(_raw·출처·실측값)와 판단 이유를 살려 카드를 충실하게 쓴다. "
+                                  "필요하면 파일을 읽어 확인한다. 도구를 쓰기 전에는 아무 글도 쓰지 말고, 출력은 카드 본문만(IMG: 줄부터).",
+                                  info["cwd"] or str(ROOT), lambda t: emit({"e": "syn", "d": t}), timeout=600)
+        if card and not er:
+            m = re.search(r"^(IMG:|#{1,3} )", card, re.M)
+            card = card[m.start():] if m else card
+        else:
+            card = None
+            emit({"e": "syn", "d": "\n\n(만든 세션이 카드를 못 써서 새로 씁니다)\n\n"})
+    if not card:
+        card = explain_run(syn, DEEP_MODEL, lambda t: emit({"e": "syn", "d": t}), system=CARD_SYS, timeout=480)
     if not card:
         emit({"e": "err", "msg": "카드 쓰기에 실패했습니다"}); return None
     emit({"e": "stage", "st": "verify", "sec": round(time.time() - t0)})
@@ -986,11 +1003,15 @@ def session_run(extra, prompt, cwd, on_text, on_tool=None, timeout=900):
 
 
 ASK_RULE = {
-    "ask": "규칙: 이 문서를 만든 맥락과 근거 자료를 바탕으로 한국어로 답한다. 확인이 필요하면 파일을 읽어도 되지만 어떤 파일도 고치지 않는다. "
-           "고른 부분과 이어서, 짧은 문단과 목록으로 10~15줄 안에서 답한다. 모르는 것은 모른다고 쓴다.",
+    "ask": "규칙: 이 문서를 만든 맥락과 근거 자료(_raw·출처·실측값·메일·회의)를 바탕으로 한국어로 충분히 자세히 답한다. 짧게 줄이지 않는다. "
+           "먼저 결론을 한두 문장으로 말하고, 이어서 원리·구조(무엇이 무엇에 어떻게 연결되는지, 시간 순서), 이 문서의 숫자와 그 출처, "
+           "헷갈리기 쉬운 점, 다음에 확인할 것을 절(## 제목)로 나눠 쓴다. 구조나 흐름은 ```mermaid 그림으로 보여 주고, 비교는 표로 쓴다. "
+           "필요하면 파일을 읽고 웹을 찾아 확인한다. 어떤 파일도 고치지 않는다. 확인 안 된 것은 ★로 표시한다.",
     "edit": "규칙: 이 HTML을 사용자 요청대로 고친다. 빌드 원본(_build/pages 조각 등)이 있으면 원본을 고치고 그 폴더의 원래 빌드 명령으로 다시 만든다. "
             "출력 _local.html만 손으로 고치지 않는다. 다른 문서·폴더는 건드리지 않는다. 사용자가 브라우저에서 바뀌는 모습을 지켜보고 있으니, "
-            "고칠 곳이 여러 군데면 한 군데 고칠 때마다 빌드해서 바로 보이게 한다. 끝나면 무엇을 바꿨는지 3줄 이내로 한국어로 답한다.",
+            "고칠 곳이 여러 군데면 한 군데 고칠 때마다 빌드해서 바로 보이게 한다. 내용은 이 문서를 만들 때와 같은 수준으로 충실하게 쓴다: "
+            "근거 자료를 다시 읽고, 필요하면 웹을 찾아 숫자와 출처를 붙이고, 이 문서의 그림·표 양식을 그대로 따른다. 한 줄 땜질로 끝내지 않는다. "
+            "끝나면 무엇을 어디에 왜 바꿨는지 한국어로 정리해 답한다.",
 }
 
 
@@ -1969,7 +1990,7 @@ TRACKER_JS = r"""
         for (;;) { const {done, value} = await rd.read(); if (done) break; buf += dec.decode(value, {stream: true});
           for (let i; (i = buf.indexOf('\n')) >= 0;) { const ln = buf.slice(0, i); buf = buf.slice(i + 1); let ev; try { ev = JSON.parse(ln); } catch { continue; }
             if (ev.e === 'lane') L[ev.id] = {...(L[ev.id] || {}), ...ev};
-            else if (ev.e === 'stage') stage = ev.st === 'write' ? '카드 쓰는 중 (초안)' : '검증 중 (초안 대조)';
+            else if (ev.e === 'stage') stage = ev.st === 'write' ? (ev.who === 'session' ? '만든 세션이 카드 쓰는 중 (초안)' : '카드 쓰는 중 (초안)') : '검증 중 (초안 대조)';
             else if (ev.e === 'syn') { acc += ev.d; imgs(acc); box.innerHTML = md(acc); fillMM(box); }
             else if (ev.e === 'final') { fin = ev.card; cache = !!ev.cache; stat = ev.stat || null; stage = cache ? '저장된 카드' : `끝 · ${ev.sec}초`; }
             else if (ev.e === 'err') err = ev.msg || '알 수 없는 오류';
@@ -2076,22 +2097,32 @@ TRACKER_JS = r"""
     if (bot < 0 || top > innerHeight) { w.hidden = true; return; }
     w.hidden = false; w.querySelector('b').textContent = WORK.label;
     Object.assign(w.style, {left: (r.left - 6) + 'px', top: top + 'px', width: (r.right - r.left + 12) + 'px', height: (bot - top) + 'px'}); };
+  const blkRect = () => { const el = (WORK?.el?.isConnected && WORK.el) || (AQ?.blk?.isConnected && AQ.blk);
+    try { if (el) return toTop(el.getBoundingClientRect(), AQ?.doc || document); } catch {} return rangeRect(); };
+  // 입력창은 화면이 아니라 본문에 붙는다: 보내기 전엔 고른 곳 아래(또는 위), 보낸 뒤엔 고치는 덩어리 옆. 스크롤하면 그 절과 같이 지나간다
   const placeAsk = () => { const a = $('.ask'); placeWork(); if (a.hidden) return;
-    a.classList.toggle('side', ASIDE);
+    a.classList.toggle('side', ASIDE); a.style.width = ''; a.style.right = 'auto'; a.style.bottom = 'auto';
     a.querySelector('[data-q="side"]').hidden = ASIDE; a.querySelector('[data-q="flip"]').hidden = !ASIDE; a.querySelector('[data-q="float"]').hidden = !ASIDE || !rangeRect();
-    const w = a.offsetWidth; let x, y;
-    if (ASIDE) {  // 옆으로 작게: 오른쪽(또는 왼쪽) 아래에 붙어 본문을 가리지 않는다
+    if (ASIDE) {
       a.style.maxHeight = Math.min(innerHeight - 140, 560) + 'px';
-      Object.assign(a.style, SIDE === 'left' ? {left: '14px', right: 'auto'} : {left: 'auto', right: '14px'}, {top: 'auto', bottom: '58px'}); return;  // 아래 모서리에 붙여 글이 늘면 위로 자란다
-    } else { a.style.bottom = 'auto'; a.style.right = 'auto'; const r = rangeRect();
-      if (!r) { a.style.maxHeight = ''; x = (innerWidth - w) / 2; y = innerHeight - a.offsetHeight - 56; }
-      else { x = Math.min(innerWidth - w - 12, Math.max(12, r.left));
-        // 고른 곳을 가리지 않게: 위·아래 중 넓은 쪽에 두고 그 칸에 맞춰 높이를 줄인다(최소 260px)
-        const below = innerHeight - r.bottom - 60, above = r.top - 20, down = below >= above, room = Math.max(260, (down ? below : above));
-        a.style.maxHeight = Math.min(room, innerHeight * 0.72, 680) + 'px'; const h2 = a.offsetHeight;
-        y = down ? r.bottom + 10 : r.top - h2 - 10;
-        y = Math.min(innerHeight - h2 - 50, Math.max(10, y)); } }
-    a.style.left = Math.max(12, x) + 'px'; a.style.top = Math.max(10, y) + 'px'; };
+      const r = blkRect();
+      if (!r) { Object.assign(a.style, SIDE === 'left' ? {left: '14px', right: 'auto'} : {left: 'auto', right: '14px'}, {top: 'auto', bottom: '58px'}); return; }
+      // 덩어리 오른쪽(또는 왼쪽) 빈칸에 붙인다. 빈칸이 300px 안 되면 화면 가장자리에 붙이되 높이는 그 덩어리 위쪽에 맞춘다
+      const gapR = innerWidth - r.right - 28, gapL = r.left - 28, pref = SIDE === 'left' ? [gapL, gapR] : [gapR, gapL];
+      let x;
+      if (pref[0] >= 300 || pref[1] >= 300) { const left = (SIDE === 'left' ? gapL >= 300 : !(gapR >= 300)); const g = left ? gapL : gapR, w = Math.min(380, g);
+        a.style.width = w + 'px'; x = left ? r.left - w - 14 : r.right + 14; }
+      else x = SIDE === 'left' ? 14 : innerWidth - Math.min(380, innerWidth - 24) - 14;
+      a.style.left = x + 'px'; a.style.top = r.top + 'px'; return;
+    }
+    const w = a.offsetWidth, r = rangeRect(); let x, y;
+    if (!r) { a.style.maxHeight = ''; x = (innerWidth - w) / 2; y = innerHeight - a.offsetHeight - 56; }
+    else { x = Math.min(innerWidth - w - 12, Math.max(12, r.left));
+      // 고른 곳을 가리지 않게 위·아래 중 넓은 쪽에 두고 그 칸에 맞춰 높이를 줄인다(최소 260px). 화면 밖으로 따라오지는 않는다
+      const below = innerHeight - r.bottom - 60, above = r.top - 20, down = below >= above, room = Math.max(260, (down ? below : above));
+      a.style.maxHeight = Math.min(room, innerHeight * 0.72, 680) + 'px'; const h2 = a.offsetHeight;
+      y = down ? r.bottom + 10 : r.top - h2 - 10; }
+    a.style.left = Math.max(12, x) + 'px'; a.style.top = y + 'px'; };
   const glide = () => { const a = $('.ask'); a.classList.add('mv'); setTimeout(() => a.classList.remove('mv'), 360); placeAsk(); };
   const saveAsk = open => { try { sessionStorage.setItem('wimask:' + K, JSON.stringify({th: $('.ask .th').innerHTML, sel: AQ?.sel, ctx: AQ?.ctx, head: AQ?.head, mode: AM, open})); } catch {} };
   const openAsk = p => {
@@ -2155,7 +2186,7 @@ TRACKER_JS = r"""
         op.add.forEach(y => { const z = document.importNode(y, true); t.insertBefore(z, before); marks.push(z.nodeType === 1 ? z : t); });
         if (!op.add.length) marks.push(t); } }
     BASE = nd; const shown = flash(marks); showJump(shown);
-    if (WORK && !WORK.el?.isConnected) WORK.el = shown[0]; placeWork();
+    if (WORK && !WORK.el?.isConnected) WORK.el = shown[0]; if (AQ && !AQ.blk?.isConnected) AQ.blk = shown[0]; placeAsk();
     return shown.length;
   }
   const sendAsk = async () => {
@@ -2212,7 +2243,8 @@ TRACKER_JS = r"""
     else if (q === 'jump') jumpChg();
     else if (q === 'reload') { try { sessionStorage.setItem('wimgo', JSON.stringify({a: anchor(), r: ratio()})); } catch {} saveAsk(true); location.reload(); } });
   $('.jump').addEventListener('click', jumpChg);
-  addEventListener('scroll', () => placeAsk(), {passive: true, capture: true}); addEventListener('resize', () => placeAsk());
+  let pRaf = 0; const rePlace = () => { if (!pRaf) pRaf = requestAnimationFrame(() => { pRaf = 0; placeAsk(); }); };
+  addEventListener('scroll', rePlace, {passive: true, capture: true}); addEventListener('resize', rePlace);
   const restoreAsk = () => { try { const v = JSON.parse(sessionStorage.getItem('wimask:' + K) || 'null'); if (!v?.open) return;
     AQ = {range: null, doc: document, sel: v.sel, ctx: v.ctx, head: v.head}; theme(); const a = $('.ask'); a.hidden = false; ASIDE = true;
     a.querySelector('.qs').innerHTML = '<b>고른 부분</b>' + esc(v.sel || ''); a.querySelector('.th').innerHTML = v.th || ''; a.querySelector('.ok button')?.remove();

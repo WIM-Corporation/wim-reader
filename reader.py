@@ -989,7 +989,8 @@ ASK_RULE = {
     "ask": "규칙: 이 문서를 만든 맥락과 근거 자료를 바탕으로 한국어로 답한다. 확인이 필요하면 파일을 읽어도 되지만 어떤 파일도 고치지 않는다. "
            "고른 부분과 이어서, 짧은 문단과 목록으로 10~15줄 안에서 답한다. 모르는 것은 모른다고 쓴다.",
     "edit": "규칙: 이 HTML을 사용자 요청대로 고친다. 빌드 원본(_build/pages 조각 등)이 있으면 원본을 고치고 그 폴더의 원래 빌드 명령으로 다시 만든다. "
-            "출력 _local.html만 손으로 고치지 않는다. 다른 문서·폴더는 건드리지 않는다. 끝나면 무엇을 바꿨는지 3줄 이내로 한국어로 답한다.",
+            "출력 _local.html만 손으로 고치지 않는다. 다른 문서·폴더는 건드리지 않는다. 사용자가 브라우저에서 바뀌는 모습을 지켜보고 있으니, "
+            "고칠 곳이 여러 군데면 한 군데 고칠 때마다 빌드해서 바로 보이게 한다. 끝나면 무엇을 바꿨는지 3줄 이내로 한국어로 답한다.",
 }
 
 
@@ -1006,6 +1007,22 @@ def _ask_run(b, push):
                              f"절: {b.get('head', '')[:200]}", f"사용자가 고른 부분: «{(b.get('sel') or '')[:2000]}»",
                              f"주변 글: «{(b.get('ctx') or '')[:1500]}»", "", b["q"].strip()[:4000], "", ASK_RULE[mode]])
         tools = (["--tools", "Read,Grep,Glob,WebSearch,WebFetch", "--setting-sources", ""] if mode == "ask" else []) + ["--permission-mode", "bypassPermissions"]
+        stop = threading.Event()
+
+        def watch():  # 고치는 동안 파일이 바뀔 때마다 알린다(브라우저가 바뀐 곳만 바로 바꿔 끼운다)
+            last = mt0
+            while not stop.wait(0.5):
+                try:
+                    m = p.stat().st_mtime
+                    if m == last:
+                        continue
+                    time.sleep(0.3)  # 쓰는 중이면 끝나길 잠깐 기다린다
+                    last = p.stat().st_mtime
+                except OSError:
+                    continue
+                push({"e": "file", "t": last})
+        if p and mode == "edit":
+            threading.Thread(target=watch, daemon=True).start()
         for attempt in range(2):
             fork, cwd = (info or {}).get("fork"), (info or {}).get("cwd") or str(ROOT)
             if fork and (PROJECTS / _slug(cwd) / f"{fork}.jsonl").exists():
@@ -1031,6 +1048,7 @@ def _ask_run(b, push):
                     c.execute("UPDATE docs SET creator_session=?, creator_cwd=?, creator_n=0, creator_mtime=? WHERE key=?", (sid, cwd, time.time(), k))
                 else:
                     c.execute("UPDATE docs SET ask_session=? WHERE key=?", (sid, k))
+        stop.set()
         changed = bool(p and p.exists() and p.stat().st_mtime != mt0)
         if err and not out:
             return push({"e": "err", "msg": err})
@@ -1486,6 +1504,17 @@ TRACKER_JS = r"""
     .ask button.p{background:var(--k-acc);border-color:var(--k-acc);color:var(--k-paper);font-weight:700;padding:5px 14px}
     .ask.edit button.p{background:var(--k-warn);border-color:var(--k-warn)}.ask button:disabled{opacity:.6}
     .card .q small{font-size:12px;color:var(--k-muted);font-weight:600}
+    .ask.mv{transition:left .32s cubic-bezier(.2,.8,.2,1),top .32s cubic-bezier(.2,.8,.2,1),bottom .32s cubic-bezier(.2,.8,.2,1),width .32s ease,max-height .32s ease}
+    .ask.side{width:min(380px,calc(100vw - 24px))}.ask.side .qs{max-height:2.9em;font-size:12px}.ask.side textarea{min-height:40px}.ask.side .hint{display:none}
+    .ask.side .ta *{font-size:13.5px}.ask.side header b{font-size:12.5px}
+    .ask .hb2{border:0;background:none;color:var(--k-muted);font-size:12px;padding:2px 7px;border-radius:6px;white-space:nowrap}.ask .hb2:hover{background:var(--k-line);color:var(--k-ink)}
+    .ask .live{display:flex;align-items:center;gap:7px;color:var(--k-acc);font-weight:700;margin:4px 0 2px}.ask .live .tm{color:var(--k-muted);font-weight:400}
+    .ask .live .sp{flex:0 0 10px;width:10px;height:10px;border:2px solid var(--k-acc);border-right-color:transparent;border-radius:50%;animation:spin .8s linear infinite}
+    .ask .live.end{color:var(--k-muted)}.ask .ok button.lnk{background:none;border:0;color:var(--k-muted);text-decoration:underline;font-weight:400}
+    .work{position:fixed;pointer-events:none;border:2px dashed var(--ac);border-radius:10px;box-shadow:0 0 0 4px color-mix(in srgb,var(--ac) 20%,transparent);animation:wpulse 1.4s ease-in-out infinite}
+    .work b{position:absolute;top:-25px;left:-2px;background:var(--ac);color:#fff;font-size:11.5px;font-weight:700;padding:3px 9px;border-radius:8px;white-space:nowrap}
+    @keyframes wpulse{50%{box-shadow:0 0 0 10px color-mix(in srgb,var(--ac) 6%,transparent)}}
+    .jump{position:fixed;left:50%;bottom:58px;transform:translateX(-50%);background:#f5b301;color:#1d1d1f;border:0;border-radius:16px;padding:7px 15px;font-weight:800;font-size:12.5px;box-shadow:0 4px 16px #0004;cursor:pointer}
     .ov{position:fixed;inset:0;background:#0009;display:flex;align-items:center;justify-content:center;padding:3vh 3vw 46px}
     .dock{position:fixed;right:62px;left:62px;bottom:0;display:flex;flex-direction:row-reverse;gap:6px;overflow-x:auto;scrollbar-width:none;pointer-events:none}
     .dock .tb{pointer-events:auto;flex:0 0 auto;display:flex;align-items:center;gap:7px;max-width:240px;height:38px;padding:0 4px 0 12px;background:var(--bg);color:var(--fg);
@@ -1614,10 +1643,11 @@ TRACKER_JS = r"""
     <nav class="toc"></nav><div class="sc"></div>
     <form><input placeholder="더 물어보기 (예: 그럼 이 문서의 경우는?)" enterkeyhint="send"></form><div class="lb" hidden></div></div></div>
   <div class="dock" hidden></div>
+  <div class="work" hidden><b></b></div><button class="jump" hidden></button>
   <button class="hb" title="설명 카드 기록 — 지금까지 만든 카드 다시 열기">카드</button>
   <div class="hp" hidden><header><b>설명 카드 기록</b> <span class="mu cnt"></span><input placeholder="용어·문서 검색"></header><div class="ls"></div></div>
   <div class="chip" hidden><button data-c="e" title="개념 카드 (e)">설명</button><button data-c="a" title="이 문서를 만든 세션에 질문·수정 요청 (a)">질문·수정</button></div>
-  <div class="ask" hidden><header><b>만든 세션에 묻기</b><small class="si"></small><button class="x" data-q="x" title="닫기 (Esc) · 진행 중인 요청은 계속됨">×</button></header>
+  <div class="ask" hidden><header><b>만든 세션에 묻기</b><small class="si"></small><button class="hb2" data-q="side" title="옆으로 작게 (본문 보면서)">옆으로 ▸</button><button class="hb2" data-q="flip" title="반대쪽으로" hidden>⇄</button><button class="hb2" data-q="float" title="고른 곳 옆에 크게" hidden>⤢</button><button class="x" data-q="x" title="닫기 (Esc) · 진행 중인 요청은 계속됨">×</button></header>
     <div class="qs"></div><div class="th"></div>
     <form><textarea rows="2"></textarea><div class="row2"><span class="seg"><button type="button" data-m="ask" class="on">질문</button><button type="button" data-m="edit">HTML 수정</button></span>
       <span class="hint">Enter 보내기 · Shift+Enter 줄바꿈</span><button class="p" type="submit">보내기</button></div></form></div>
@@ -2031,54 +2061,142 @@ TRACKER_JS = r"""
     }
     h.err('서버와 연결이 계속 끊깁니다');
   }
-  let AQ = null, AM = 'ask', abusy = false;
+  let AQ = null, AM = 'ask', abusy = false, ASIDE = false, BASE = null, WORK = null, LASTCHG = [];
+  let SIDE = 'right'; try { SIDE = localStorage.getItem('wimaskside') || 'right'; } catch {}
   const AP = {ask: '예: 그럼 지금 하드웨어는 USB로 연결된 건가? USB 대기는 뭐지?', edit: '예: 이 그림 아래에 USB 대기가 무엇인지 한 문단 추가해줘'};
   const setMode = m => { AM = m; const a = $('.ask'); a.classList.toggle('edit', m === 'edit');
     a.querySelectorAll('[data-m]').forEach(b => b.classList.toggle('on', b.dataset.m === m)); a.querySelector('textarea').placeholder = AP[m]; };
-  const placeAsk = () => { const a = $('.ask'); if (a.hidden) return;
-    const w = a.offsetWidth, h = a.offsetHeight; let r = null;
-    try { if (AQ?.range) { const b = AQ.range.getBoundingClientRect(); if (b.width || b.height) r = toTop(b, AQ.doc); } } catch {}
-    let x, y;
-    if (!r) { a.style.maxHeight = ''; x = (innerWidth - w) / 2; y = innerHeight - a.offsetHeight - 56; }
-    else { x = Math.min(innerWidth - w - 12, Math.max(12, r.left));
-      // 고른 곳을 가리지 않게: 위·아래 중 넓은 쪽에 두고 그 칸에 맞춰 높이를 줄인다(최소 260px)
-      const below = innerHeight - r.bottom - 60, above = r.top - 20, down = below >= above, room = Math.max(260, (down ? below : above));
-      a.style.maxHeight = Math.min(room, innerHeight * 0.72, 680) + 'px'; const h2 = a.offsetHeight;
-      y = down ? r.bottom + 10 : r.top - h2 - 10;
-      y = Math.min(innerHeight - h2 - 50, Math.max(10, y)); }  // 고른 곳이 화면 밖으로 가면 가장자리에 붙는다
+  const rangeRect = () => { try { if (AQ?.range) { const b = AQ.range.getBoundingClientRect(); if (b.width || b.height) return toTop(b, AQ.doc); } } catch {} return null; };
+  // 고친 곳·묻는 곳 표시: 고른 덩어리(그림·문단)를 점선 테두리로 감싸고 '고치는 중' 딱지를 단다
+  const placeWork = () => { const w = $('.work');
+    if (!WORK) { w.hidden = true; return; }
+    let r = null; try { if (WORK.el?.isConnected) r = toTop(WORK.el.getBoundingClientRect(), AQ?.doc || document); } catch {}
+    r = r || rangeRect(); if (!r) { w.hidden = true; return; }
+    const top = Math.max(-20, r.top - 6), bot = Math.min(innerHeight + 20, r.bottom + 6);
+    if (bot < 0 || top > innerHeight) { w.hidden = true; return; }
+    w.hidden = false; w.querySelector('b').textContent = WORK.label;
+    Object.assign(w.style, {left: (r.left - 6) + 'px', top: top + 'px', width: (r.right - r.left + 12) + 'px', height: (bot - top) + 'px'}); };
+  const placeAsk = () => { const a = $('.ask'); placeWork(); if (a.hidden) return;
+    a.classList.toggle('side', ASIDE);
+    a.querySelector('[data-q="side"]').hidden = ASIDE; a.querySelector('[data-q="flip"]').hidden = !ASIDE; a.querySelector('[data-q="float"]').hidden = !ASIDE || !rangeRect();
+    const w = a.offsetWidth; let x, y;
+    if (ASIDE) {  // 옆으로 작게: 오른쪽(또는 왼쪽) 아래에 붙어 본문을 가리지 않는다
+      a.style.maxHeight = Math.min(innerHeight - 140, 560) + 'px';
+      Object.assign(a.style, SIDE === 'left' ? {left: '14px', right: 'auto'} : {left: 'auto', right: '14px'}, {top: 'auto', bottom: '58px'}); return;  // 아래 모서리에 붙여 글이 늘면 위로 자란다
+    } else { a.style.bottom = 'auto'; a.style.right = 'auto'; const r = rangeRect();
+      if (!r) { a.style.maxHeight = ''; x = (innerWidth - w) / 2; y = innerHeight - a.offsetHeight - 56; }
+      else { x = Math.min(innerWidth - w - 12, Math.max(12, r.left));
+        // 고른 곳을 가리지 않게: 위·아래 중 넓은 쪽에 두고 그 칸에 맞춰 높이를 줄인다(최소 260px)
+        const below = innerHeight - r.bottom - 60, above = r.top - 20, down = below >= above, room = Math.max(260, (down ? below : above));
+        a.style.maxHeight = Math.min(room, innerHeight * 0.72, 680) + 'px'; const h2 = a.offsetHeight;
+        y = down ? r.bottom + 10 : r.top - h2 - 10;
+        y = Math.min(innerHeight - h2 - 50, Math.max(10, y)); } }
     a.style.left = Math.max(12, x) + 'px'; a.style.top = Math.max(10, y) + 'px'; };
+  const glide = () => { const a = $('.ask'); a.classList.add('mv'); setTimeout(() => a.classList.remove('mv'), 360); placeAsk(); };
   const saveAsk = open => { try { sessionStorage.setItem('wimask:' + K, JSON.stringify({th: $('.ask .th').innerHTML, sel: AQ?.sel, ctx: AQ?.ctx, head: AQ?.head, mode: AM, open})); } catch {} };
   const openAsk = p => {
     if (!p) return; $('.chip').hidden = true;
-    AQ = {range: p.range || null, doc: p.odoc || document, sel: p.term, ctx: p.ctx, head: p.head};
+    const n0 = p.range?.startContainer, e0 = n0 && (n0.nodeType === 1 ? n0 : n0.parentElement);
+    let blk = e0?.closest?.('figure') || e0?.closest?.('svg') || e0?.closest?.(BLK) || e0; while (blk?.ownerSVGElement) blk = blk.ownerSVGElement;
+    AQ = {range: p.range || null, doc: p.odoc || document, sel: p.term, ctx: p.ctx, head: p.head, blk};
     try { p.odoc?.getSelection().removeAllRanges(); getSelection().removeAllRanges(); R.getSelection?.()?.removeAllRanges(); } catch {}
-    theme(); const a = $('.ask'); a.hidden = false;
+    theme(); const a = $('.ask'); a.hidden = false; ASIDE = false;
     a.querySelector('.qs').innerHTML = '<b>고른 부분</b>' + esc(p.term.length > 600 ? p.term.slice(0, 600) + '…' : p.term);
     a.querySelector('.si').textContent = sessLabel(SIC[K]);
     sessOf(K).then(si => a.querySelector('.si').textContent = sessLabel(si));
-    setMode(AM); placeAsk(); a.querySelector('textarea').focus();
+    setMode(AM); glide(); a.querySelector('textarea').focus();
   };
   const closeAsk = () => { $('.ask').hidden = true; saveAsk(false); };
+  // ---- 화면에 바로 반영: 고친 파일을 다시 받아 이전 파일과 비교하고, 바뀐 가장 작은 덩어리만 화면 DOM에서 바꾼다 ----
+  const loadFile = () => fetch(location.href.split('#')[0], {cache: 'no-store'}).then(r => r.text()).then(t => new DOMParser().parseFromString(t, 'text/html'));
+  const kidsOf = el => [...el.childNodes].filter(n => n.nodeType === 1 ? !(n.id === '__wim_reader' || /^(SCRIPT|NOSCRIPT)$/.test(n.tagName)) : n.nodeType === 3 && n.data.trim());
+  const sameN = (x, y) => x.nodeType === 3 ? x.data === y.data : x.outerHTML === y.outerHTML;
+  const attrsEq = (x, y) => x.attributes.length === y.attributes.length && [...x.attributes].every(t => y.getAttribute(t.name) === t.value);
+  const diffT = (a, b, path, ops, d) => {
+    const A = kidsOf(a), B = kidsOf(b);
+    if (A.length === B.length && A.every((x, i) => x.nodeName === B[i].nodeName)) {
+      A.forEach((x, i) => { if (sameN(x, B[i])) return;
+        if (x.nodeType === 1 && d < 16 && attrsEq(x, B[i]) && kidsOf(x).length) diffT(x, B[i], [...path, i], ops, d + 1);
+        else ops.push({k: 'rep', path: [...path, i], name: x.nodeName, node: B[i]}); });
+    } else {
+      let s = 0; while (s < A.length && s < B.length && sameN(A[s], B[s])) s++;
+      let e = 0; while (e < A.length - s && e < B.length - s && sameN(A[A.length - 1 - e], B[B.length - 1 - e])) e++;
+      ops.push({k: 'spl', path, s, del: A.length - s - e, add: B.slice(s, B.length - e), names: A.map(x => x.nodeName)});
+    } };
+  const nodeAt = (root, path) => { let n = root; for (const i of path) { n = kidsOf(n)[i]; if (!n) return null; } return n; };
+  const flashCss = () => { if (document.getElementById('__wimfl')) return; const s = document.createElement('style'); s.id = '__wimfl';
+    s.textContent = '@keyframes __wimfl{0%{outline-color:rgba(245,179,1,.95);box-shadow:0 0 0 7px rgba(245,179,1,.35);background-color:rgba(245,179,1,.2)}'
+      + '100%{outline-color:rgba(245,179,1,0);box-shadow:0 0 0 0 rgba(245,179,1,0)}}.__wimfl{outline:3px solid transparent;outline-offset:3px;border-radius:6px;animation:__wimfl 3.4s ease-out 1}';
+    document.head.append(s); };
+  const flash = els => { flashCss(); const out = [];
+    for (let el of els) { if (!el?.isConnected) continue; while (el.ownerSVGElement) el = el.ownerSVGElement;
+      if (el === document.body || out.some(o => o.contains(el))) continue; out.push(el); }
+    out.slice(0, 40).forEach(el => { el.classList.remove('__wimfl'); void el.offsetWidth; el.classList.add('__wimfl'); setTimeout(() => el.classList.remove('__wimfl'), 3600); });
+    return out; };
+  const showJump = els => { const j = $('.jump'); LASTCHG = els; if (!els.length) return;
+    const r = els[0].getBoundingClientRect(); if (r.bottom > 0 && r.top < innerHeight) { j.hidden = true; return; }
+    j.textContent = `${r.top > 0 ? '↓' : '↑'} 바뀐 곳 보기 · ${els.length}곳`; j.hidden = false; clearTimeout(j._t); j._t = setTimeout(() => j.hidden = true, 15000); };
+  const jumpChg = () => { $('.jump').hidden = true; const el = LASTCHG.find(x => x.isConnected); if (el) { el.scrollIntoView({block: 'center', behavior: 'smooth'}); setTimeout(() => flash([el]), 450); } };
+  async function liveApply() {
+    let nd; try { nd = await loadFile(); } catch { return -1; }
+    if (!BASE) { BASE = nd; return -1; }
+    const ops = []; diffT(BASE.body, nd.body, [], ops, 0);
+    const os = [...document.head.querySelectorAll('style:not(#__wimfl)')], ns = [...nd.head.querySelectorAll('style')];
+    ns.forEach((x, i) => { if (os[i] && os[i].textContent !== x.textContent) os[i].textContent = x.textContent; });
+    if (nd.title && nd.title !== document.title) document.title = nd.title;
+    if (!ops.length) { BASE = nd; return 0; }
+    const acts = ops.map(op => ({op, t: nodeAt(document.body, op.path)}));
+    for (const {op, t} of acts) {  // 화면이 파일과 같은 모양인지 먼저 본다(페이지 스크립트가 바꾼 곳이면 새로고침으로)
+      if (!t || (op.k === 'rep' ? t.nodeName !== op.name : (kidsOf(t).length !== op.names.length || kidsOf(t).some((x, i) => x.nodeName !== op.names[i])))) { BASE = nd; return -1; } }
+    const marks = [];
+    for (const {op, t} of acts) {
+      if (op.k === 'rep') { const z = document.importNode(op.node, true); t.replaceWith(z); marks.push(z.nodeType === 1 ? z : z.parentElement); }
+      else { const L = kidsOf(t), before = L[op.s + op.del] || null; L.slice(op.s, op.s + op.del).forEach(n => n.remove());
+        op.add.forEach(y => { const z = document.importNode(y, true); t.insertBefore(z, before); marks.push(z.nodeType === 1 ? z : t); });
+        if (!op.add.length) marks.push(t); } }
+    BASE = nd; const shown = flash(marks); showJump(shown);
+    if (WORK && !WORK.el?.isConnected) WORK.el = shown[0]; placeWork();
+    return shown.length;
+  }
   const sendAsk = async () => {
     const a = $('.ask'), t = a.querySelector('textarea'), q = t.value.trim(); if (!q || abusy) return;
     abusy = true; t.value = ''; const mode = AM, btn = a.querySelector('button.p'); btn.disabled = true; btn.textContent = '처리 중…';
+    ASIDE = true; WORK = {label: mode === 'edit' ? '만든 세션이 고치는 중…' : '만든 세션이 읽는 중…', el: AQ?.blk || null}; glide();
+    if (mode === 'edit' && !BASE) { try { BASE = await loadFile(); } catch {} }
     const th = a.querySelector('.th'), item = document.createElement('div');
-    item.innerHTML = `<div class="tq"><i class="${mode === 'edit' ? 'ed' : ''}">${mode === 'edit' ? 'HTML 수정' : '질문'}</i>${esc(q)}</div><div class="tls"></div><div class="ta cur"></div>`;
+    item.innerHTML = `<div class="tq"><i class="${mode === 'edit' ? 'ed' : ''}">${mode === 'edit' ? 'HTML 수정' : '질문'}</i>${esc(q)}</div>`
+      + '<div class="tl live"><span class="sp"></span><span class="st">보냄 · 세션 여는 중</span><span class="tm">0초</span></div><div class="tls"></div><div class="ta cur"></div>';
     th.append(item); th.scrollTop = th.scrollHeight; placeAsk();
-    const tls = item.querySelector('.tls'), ta = item.querySelector('.ta'); let txt = '';
+    const tls = item.querySelector('.tls'), ta = item.querySelector('.ta'), st = item.querySelector('.st'), tm = item.querySelector('.tm'), t0 = Date.now();
+    const tick = setInterval(() => tm.textContent = Math.round((Date.now() - t0) / 1000) + '초', 1000);
+    let txt = '', nchg = 0, stale = false, chain = Promise.resolve();
+    const stage = m => { st.textContent = m; };
     const line = m => { tls.insertAdjacentHTML('beforeend', `<div class="tl">${esc(m)}</div>`); th.scrollTop = th.scrollHeight; };
+    const apply = () => chain = chain.then(async () => { stage('화면에 반영 중'); const n = await liveApply();
+      if (n > 0) { nchg += n; line(`화면에 반영 · ${n}곳`); } else if (n < 0) stale = true; });
+    let fin = null;
     await askStream({sel: AQ?.sel || '', ctx: AQ?.ctx || '', head: AQ?.head || '', q, mode}, {
       reset: () => { txt = ''; tls.innerHTML = ''; ta.innerHTML = ''; },
-      meta: ev => { line(ev.how === 'cont' ? '같은 대화에 이어서 묻는 중…' : ev.how === 'fork' ? `만든 세션 ${String(ev.sid).slice(0, 8)}을 이어받아 묻는 중… (첫 질문은 맥락을 불러오느라 조금 걸림)` : '만든 세션을 못 찾아 새 세션으로 묻는 중…'); },
-      tool: ev => line(`${TOOLK[ev.name] || ev.name} · ${ev.arg || ''}`),
+      meta: ev => { stage(ev.how === 'cont' ? '같은 대화에 이어서 묻는 중' : ev.how === 'fork' ? '만든 세션 맥락 불러오는 중' : '새 세션 여는 중');
+        if (ev.how === 'fork') line(`만든 세션 ${String(ev.sid).slice(0, 8)}을 이어받음`); else if (ev.how === 'new') line('만든 세션을 못 찾아 새 세션으로'); },
+      tool: ev => { stage(`${TOOLK[ev.name] || ev.name} 중`); line(`${TOOLK[ev.name] || ev.name} · ${ev.arg || ''}`); },
+      file: () => apply(),
       note: ev => line(ev.msg),
-      text: ev => { txt += ev.d; ta.innerHTML = md(txt); th.scrollTop = th.scrollHeight; placeAsk(); },
-      done: ev => { ta.classList.remove('cur'); if (!txt) ta.innerHTML = '';
-        if (ev.changed) item.insertAdjacentHTML('beforeend', `<div class="ok">HTML이 고쳐졌습니다 · ${ev.sec}초<button type="button" data-q="reload">새로고침해서 보기</button></div>`);
-        else if (mode === 'edit') line('파일 변화 없음'); else line(`${ev.sec}초`); },
-      err: m => { ta.classList.remove('cur'); ta.innerHTML = md(txt) + `<p style="color:var(--k-warn)">[실패] ${esc(m)}</p>`; }
+      text: ev => { stage(mode === 'edit' ? '고치며 설명 쓰는 중' : '답 쓰는 중'); txt += ev.d; ta.innerHTML = md(txt); th.scrollTop = th.scrollHeight; },
+      done: ev => { fin = ev; },
+      err: m => { fin = {err: m}; }
     });
-    abusy = false; btn.disabled = false; btn.textContent = '보내기'; saveAsk(!a.hidden); placeAsk();
+    if (fin?.changed) apply();  // 마지막 빌드가 감시 틈에 걸렸을 수 있다
+    await chain; clearInterval(tick); ta.classList.remove('cur');
+    const live = item.querySelector('.live'); live.classList.add('end'); live.querySelector('.sp').remove();
+    if (fin?.err && !fin.sec) { stage('실패'); ta.innerHTML = md(txt) + `<p style="color:var(--k-warn)">[실패] ${esc(fin.err)}</p>`; }
+    else { stage(fin?.changed ? (nchg ? '끝 · 화면에 반영됨' : '끝 · 파일 고침') : mode === 'edit' ? '끝 · 파일 변화 없음' : '끝');
+      if (!txt) ta.innerHTML = '';
+      if (fin?.changed) item.insertAdjacentHTML('beforeend', nchg && !stale
+        ? `<div class="ok">화면에 바로 반영했습니다 · ${nchg}곳<button type="button" data-q="jump">바뀐 곳 보기</button><button type="button" class="lnk" data-q="reload">새로고침</button></div>`
+        : `<div class="ok">HTML이 고쳐졌습니다 · 이 페이지는 스크립트로 그려져 새로고침이 필요합니다<button type="button" data-q="reload">새로고침해서 보기</button></div>`); }
+    WORK = null; placeWork();
+    abusy = false; btn.disabled = false; btn.textContent = '보내기'; saveAsk(!a.hidden); placeAsk(); th.scrollTop = th.scrollHeight;
     delete SIC[K]; sessOf(K).then(si => a.querySelector('.si').textContent = sessLabel(si));
   };
   $('.ask form').addEventListener('submit', e => { e.preventDefault(); sendAsk(); });
@@ -2088,10 +2206,15 @@ TRACKER_JS = r"""
   $('.ask').addEventListener('click', e => { const q = e.target.closest('[data-q]')?.dataset.q, m = e.target.closest('[data-m]')?.dataset.m;
     if (m) setMode(m);
     else if (q === 'x') closeAsk();
+    else if (q === 'side') { ASIDE = true; glide(); }
+    else if (q === 'float') { ASIDE = false; glide(); }
+    else if (q === 'flip') { SIDE = SIDE === 'left' ? 'right' : 'left'; try { localStorage.setItem('wimaskside', SIDE); } catch {} glide(); }
+    else if (q === 'jump') jumpChg();
     else if (q === 'reload') { try { sessionStorage.setItem('wimgo', JSON.stringify({a: anchor(), r: ratio()})); } catch {} saveAsk(true); location.reload(); } });
+  $('.jump').addEventListener('click', jumpChg);
   addEventListener('scroll', () => placeAsk(), {passive: true, capture: true}); addEventListener('resize', () => placeAsk());
   const restoreAsk = () => { try { const v = JSON.parse(sessionStorage.getItem('wimask:' + K) || 'null'); if (!v?.open) return;
-    AQ = {range: null, doc: document, sel: v.sel, ctx: v.ctx, head: v.head}; theme(); const a = $('.ask'); a.hidden = false;
+    AQ = {range: null, doc: document, sel: v.sel, ctx: v.ctx, head: v.head}; theme(); const a = $('.ask'); a.hidden = false; ASIDE = true;
     a.querySelector('.qs').innerHTML = '<b>고른 부분</b>' + esc(v.sel || ''); a.querySelector('.th').innerHTML = v.th || ''; a.querySelector('.ok button')?.remove();
     setMode(v.mode || 'ask'); sessOf(K).then(si => a.querySelector('.si').textContent = sessLabel(si)); placeAsk(); a.querySelector('.th').scrollTop = 1e9; } catch {} };
   // 개념 카드의 '더 물어보기'도 만든 세션이 있으면 그 세션에 묻는다

@@ -1,0 +1,30 @@
+{
+ "skill_name": "html-brief",
+ "note": "Trigger checks. Generic prompts in Korean and English.",
+ "evals": [
+  {
+   "id": 0,
+   "prompt": "./reading_list 폴더에 있는 html 열두 개 내용 병합해서 한장으로 만들어줘. 방대한 1장이어도 상관없어, 쪼개져 있는 게 싫어",
+   "expected_output": "묶음 통합: bundle_init → 파트별 정리 층 에이전트 → build_parts → check_parts, 파트마다 한 장",
+   "expected_skill": "html-brief"
+  },
+  {
+   "id": 1,
+   "prompt": "Merge these HTML reports into one page per part, but don't lose any information from the originals.",
+   "expected_output": "Per-part synthesis layer + full originals, loss check reported as match count and coverage",
+   "expected_skill": "html-brief"
+  },
+  {
+   "id": 2,
+   "prompt": "가정용 태양광 패널 설치 비용과 원리를 조사한 거 html로 정리해줘, 그림 많이 넣어서",
+   "expected_output": "new_pack 브리프 → 조각 작성 → check → build → open",
+   "expected_skill": "html-brief"
+  },
+  {
+   "id": 3,
+   "prompt": "Make a learning pack about how heat pumps work, as HTML with lots of diagrams and less text.",
+   "expected_output": "new_pack --pack → chapters with one section per term → check → build → open the one-page edition",
+   "expected_skill": "html-brief"
+  }
+ ]
+}

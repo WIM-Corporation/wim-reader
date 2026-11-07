@@ -1,0 +1,5 @@
+.wim_reader/
+reader_chrome_ext/
+__pycache__/
+*.pyc
+.DS_Store

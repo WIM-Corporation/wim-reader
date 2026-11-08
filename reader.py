@@ -1066,15 +1066,24 @@ def session_run(extra, prompt, cwd, on_text, on_tool=None, timeout=900, on_init=
 
 ASK_RULE = {
     "ask": "규칙: 이 문서를 만든 맥락과 근거 자료(_raw·출처·실측값·메일·회의)를 바탕으로 한국어로 충분히 자세히 답한다. 짧게 줄이지 않는다. "
-           "먼저 결론을 한두 문장으로 말하고, 이어서 원리·구조(무엇이 무엇에 어떻게 연결되는지, 시간 순서), 이 문서의 숫자와 그 출처, "
-           "헷갈리기 쉬운 점, 다음에 확인할 것을 절(## 제목)로 나눠 쓴다. 구조나 흐름은 ```mermaid 그림으로 보여 주고, 비교는 표로 쓴다. "
+           "읽는 사람은 이 분야 비전공자라고 가정한다. 글보다 그림으로 설명한다: "
+           "먼저 결론을 한두 문장으로 말하고, 절(## 제목)마다 ```mermaid 그림을 하나 이상 넣는다. "
+           "구조는 flowchart(무엇이 무엇에 연결되는지), 시간 순서는 sequenceDiagram, 상태 변화는 stateDiagram, 비교는 표로 그린다. "
+           "그림 밑 글은 그림을 읽는 법 두세 문장이면 된다. 함수 이름·레지스터·소스 행 번호 같은 코드 수준 근거는 본문에 늘어놓지 말고 마지막 '근거' 절에 한 줄씩 모은다. "
+           "이 문서의 숫자와 그 출처, 헷갈리기 쉬운 점, 다음에 확인할 것도 넣는다. "
            "필요하면 파일을 읽고 웹을 찾아 확인한다. 어떤 파일도 고치지 않는다. 확인 안 된 것은 ★로 표시한다. "
            "에이전트(Agent)를 쓸 때는 run_in_background를 쓰지 말고 결과를 받은 뒤 다음으로 간다. '기다리겠다'며 턴을 끝내지 않는다: 턴이 끝나면 작업도 끝난다. ",
     "edit": "규칙: 이 HTML을 사용자 요청대로 고친다. 빌드 원본(_build/pages 조각 등)이 있으면 원본을 고치고 그 폴더의 원래 빌드 명령으로 다시 만든다. "
-            "출력 _local.html만 손으로 고치지 않는다. 다른 문서·폴더는 건드리지 않는다. 사용자가 브라우저에서 바뀌는 모습을 지켜보고 있으니, "
-            "고칠 곳이 여러 군데면 한 군데 고칠 때마다 빌드해서 바로 보이게 한다. 내용은 이 문서를 만들 때와 같은 수준으로 충실하게 쓴다: "
-            "근거 자료를 다시 읽고, 필요하면 웹을 찾아 숫자와 출처를 붙이고, 이 문서의 그림·표 양식을 그대로 따른다. 한 줄 땜질로 끝내지 않는다. "
-            "끝나면 무엇을 어디에 왜 바꿨는지 한국어로 정리해 답한다. "
+            "출력 _local.html만 손으로 고치지 않는다. 다른 문서·폴더는 건드리지 않는다. "
+            "그림 위주로 쓴다(가장 중요한 규칙): 읽는 사람은 비전공자라고 가정하고, 새로 쓰거나 고치는 절마다 SVG 그림을 먼저 만든다. "
+            "구조·연결은 아키텍처·블록도, 시간 순서는 타임라인·시퀀스, 원리는 신호·데이터 흐름도, 선택지는 나란히 비교 그림이나 판정 격자로 그린다. "
+            "새 절 하나에 그림 2개 이상, 설명은 그림 안 라벨로 옮기고 절 본문은 한두 문장, 캡션은 그림 하나당 250자 이하로 쓴다. "
+            "함수 이름·레지스터 주소·소스 행 번호·인용문 같은 코드 수준 근거는 문단으로 늘어놓지 않는다: 꼭 필요한 것만 그림 라벨에 넣고 나머지는 접힌 '근거 더 보기'에 한 줄씩 짧게 둔다. "
+            "기존 절이 글로 가득하면(접힌 부분 포함) 그 글을 그림으로 바꾸는 것도 고치는 일에 포함한다. "
+            "이 문서 폴더나 _build의 AUTHORING.md, 그리고 html-brief 스킬 규격(~/.claude/skills/html-brief/references/authoring.md 또는 이 폴더 위쪽 .claude/skills/html-brief/references/authoring.md)이 있으면 먼저 읽고 따른다. "
+            "사용자가 브라우저에서 바뀌는 모습을 지켜보고 있으니, 고칠 곳이 여러 군데면 한 군데 고칠 때마다 빌드해서 바로 보이게 한다. "
+            "내용은 이 문서를 만들 때와 같은 수준으로 충실하게 쓴다: 근거 자료를 다시 읽고, 필요하면 웹을 찾아 숫자와 출처를 붙이고, 이 문서의 그림 양식(SVG 클래스·색)을 그대로 따른다. 한 줄 땜질로 끝내지 않는다. "
+            "끝나면 무엇을 어디에 왜 바꿨는지, 그림을 몇 개 넣었는지 한국어로 정리해 답한다. "
             "에이전트(Agent)를 쓸 때는 run_in_background를 쓰지 말고 결과를 받은 뒤 다음으로 간다. '기다리겠다'며 턴을 끝내지 않는다: 턴이 끝나면 작업도 끝난다. ""원본을 고쳤으면 턴을 끝내기 전에 반드시 빌드까지 마친다.",
 }
 
@@ -1690,6 +1699,8 @@ TRACKER_JS = r"""
     .ask .tl,.card .tl{font:11.5px/1.5 ui-monospace,Menlo,monospace;color:var(--k-muted);margin:1px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
     .ask .ta *{font-size:14.5px;line-height:1.65}.ask .ta p{margin:6px 0}.ask .ta ul,.ask .ta ol{margin:4px 0 8px;padding-left:1.3em}
     .ask .ta h2{font-size:15px;margin:10px 0 4px}.ask .ta h2 .n{display:none}.ask .ta code{font-family:ui-monospace,Menlo,monospace;font-size:13px;background:var(--k-box);padding:1px 4px;border-radius:4px}
+    .ask .ta .mm{margin:10px 0;padding:10px;background:var(--k-bg);border:1px solid var(--k-line);border-radius:10px;overflow-x:auto;text-align:center;min-height:40px}
+    .ask .ta .mm:empty::before{content:'그림 그리는 중…';color:var(--k-muted);font-size:13px}.ask .ta .mm svg{max-width:100%;height:auto}.ask .ta .mm svg *{font:inherit}
     .ask .ta a{color:var(--k-acc)}.ask .ta table{border-collapse:collapse;margin:6px 0}.ask .ta td,.ask .ta th{border:1px solid var(--k-line);padding:4px 8px;font-size:13px}
     .ask .cur::after{content:'▍';color:var(--k-acc);animation:bl 1s steps(2) infinite}
     .ask .ok{margin:8px 0;padding:8px 10px;border-radius:8px;background:color-mix(in srgb,var(--k-ok) 16%,transparent);font-size:13.5px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
@@ -1991,6 +2002,7 @@ TRACKER_JS = r"""
     catch (e) { SVG.set(key, `<pre class="mmerr">다이어그램을 못 그렸다. 원본:\n${esc(code)}</pre>`);
       document.querySelectorAll('[id^="dwimmm"],[id^="wimmm"]').forEach(x => { if (!x.closest('#__wim_reader')) x.remove(); }); }
     SS.forEach(s => s.bd.querySelectorAll('.mm[data-c]').forEach(x => { if (x.dataset.c === code) x.innerHTML = SVG.get(key); }));
+    PANES.forEach(P => P.el.querySelectorAll('.mm[data-c]').forEach(x => { if (x.dataset.c === code) x.innerHTML = SVG.get(key); }));  // 질문·수정 창의 그림도
   });
   const loadImgs = (line, gal) => {
     const ts = line.split('|').map(x => x.trim()).filter(Boolean);
@@ -2462,12 +2474,12 @@ TRACKER_JS = r"""
       tool: ev => { stage(`${TOOLK[ev.name] || ev.name} 중`); line(`${TOOLK[ev.name] || ev.name} · ${ev.arg || ''}`); },
       file: () => apply(),
       note: ev => line(ev.msg),
-      text: ev => { stage(mode === 'edit' ? '고치며 설명 쓰는 중' : '답 쓰는 중'); txt += ev.d; ta.innerHTML = md(txt); if (FOCUS === P) th.scrollTop = th.scrollHeight; },
+      text: ev => { stage(mode === 'edit' ? '고치며 설명 쓰는 중' : '답 쓰는 중'); txt += ev.d; ta.innerHTML = md(txt); fillMM(ta); if (FOCUS === P) th.scrollTop = th.scrollHeight; },
       done: ev => { fin = ev; }, err: m => { fin = {err: m}; } }, id, reattach);
     if (fin?.changed) apply();  // 마지막 빌드가 감시 틈에 걸렸을 수 있다
     await LIVE; clearInterval(tick); ta.classList.remove('cur'); item.dataset.run = '0';
     const live = item.querySelector('.live'); live.classList.add('end'); live.querySelector('.sp')?.remove();
-    if (fin?.err && !fin.sec) { stage('실패'); ta.innerHTML = md(txt) + `<p style="color:var(--k-warn)">[실패] ${esc(fin.err)}</p>`; }
+    if (fin?.err && !fin.sec) { stage('실패'); ta.innerHTML = md(txt) + `<p style="color:var(--k-warn)">[실패] ${esc(fin.err)}</p>`; fillMM(ta); }
     else { const half = !fin?.changed && fin?.src?.length;
       stage(fin?.changed ? (nchg ? '끝 · 화면에 반영됨' : '끝 · 파일 고침') : half ? '멈춤 · 원본만 고침(빌드 안 됨)' : mode === 'edit' ? '끝 · 파일 변화 없음' : '끝');
       if (!txt) ta.innerHTML = '';
@@ -2488,7 +2500,7 @@ TRACKER_JS = r"""
     for (const v of L) { const f = findBySig(v.sig); const P = newPane({...v, blk: f?.el || null, doc: f?.doc || document, side: true});
       // 새로고침 전에 돌던 요청: 같은 작업 id로 다시 붙어 이어 받는다(서버가 재시작됐어도 기록에서)
       P.el.querySelectorAll('.th > div[data-run="1"]').forEach(it => runItem(P, it, {sel: P.sel, ctx: P.ctx, head: P.head, q: it.dataset.q, mode: it.dataset.mode, thread: P.thread, blk: P.sig}, true)); }
-    FOCUS = PANES.at(-1) || null; layout(); } catch {} };
+    PANES.forEach(P => fillMM(P.el)); FOCUS = PANES.at(-1) || null; layout(); } catch {} };
   // 개념 카드의 '더 물어보기'도 만든 세션이 있으면 그 세션에 묻는다
   async function askCard(S, q) {
     setBusy(S, true, '만든 세션이 답하는 중…'); setTag(S, '만든 세션에 묻는 중');

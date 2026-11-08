@@ -2668,6 +2668,10 @@ TRACKER_JS = r"""
       if (!KN.has(h)) { KN.add(h); newSeen.push(h); if (RBASE && Date.now() / 1000 - RBASE > 120 && !RD.has(h)) FR.add(h); }
     }
     const old = new Map(BL.map(b => [b.h, b.dw])); out.forEach(b => b.dw = old.get(b.h) || 0);  // 다시 셀 때 머문 시간 유지
+    // 덩어리 기록이 처음인 문서: 예전 방식(스크롤 최고 깊이)으로 읽은 데까지는 읽음으로 옮겨 준다(고쳐진 뒤면 옮기지 않는다)
+    if (!RBASE && !RD.size && newSeen.length && D?.max_ratio > 0.02 && !(D.revised_at > (D.last_open || 0))) {
+      const lim = D.max_ratio * span() + (S ? S.clientHeight : innerHeight);
+      for (const b of out) if (docY(b.el.getBoundingClientRect()) + 8 < lim) { RD.add(b.h); PEND.add(b.h); } }
     BL = out; if (newSeen.length) { SEENP.push(...newSeen); if (!RBASE) RBASE = Date.now() / 1000; dirty = true; }
     RBIO?.disconnect(); RBVIS.clear();
     RBIO = new IntersectionObserver(es => es.forEach(e => RBVIS.set(e.target, e.isIntersecting ? e.intersectionRect.height : 0)), {threshold: [0, .1, .25, .4, .6, .8, 1]});

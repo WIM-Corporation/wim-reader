@@ -94,6 +94,7 @@ CREATE TABLE IF NOT EXISTS visits(id INTEGER PRIMARY KEY, key TEXT, device TEXT,
   active_sec INTEGER DEFAULT 0, max_ratio REAL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS explains(id INTEGER PRIMARY KEY, key TEXT, term TEXT, q TEXT, ctx_hash TEXT, answer TEXT,
   model TEXT, created_at REAL);
+CREATE TABLE IF NOT EXISTS blocks(key TEXT, h TEXT, first_seen REAL, read_at REAL, PRIMARY KEY(key, h));
 CREATE INDEX IF NOT EXISTS marks_key ON marks(key);
 CREATE INDEX IF NOT EXISTS explains_hash ON explains(ctx_hash);
 CREATE INDEX IF NOT EXISTS visits_key ON visits(key);
@@ -108,7 +109,8 @@ def db():
     c.executescript(SCHEMA)
     have = {r[1] for r in c.execute("PRAGMA table_info(docs)")}
     for col, typ in (("content_hash", "TEXT"), ("hash_mtime", "REAL"), ("revised_at", "REAL"), ("creator_session", "TEXT"), ("creator_cwd", "TEXT"),
-                     ("creator_n", "INTEGER"), ("creator_mtime", "REAL"), ("ask_session", "TEXT")):
+                     ("creator_n", "INTEGER"), ("creator_mtime", "REAL"), ("ask_session", "TEXT"),
+                     ("blk_total", "INTEGER"), ("blk_read", "INTEGER"), ("blk_new", "INTEGER"), ("read_pct", "REAL")):
         if col not in have:
             c.execute(f"ALTER TABLE docs ADD COLUMN {col} {typ}")
     return c
@@ -237,19 +239,28 @@ def merged(c=None):
             items.append({"k": k, "title": d["title"] or nfc(p.stem), "group": "그 밖에 연 문서", "folder": nfc(p.parent.name), "mtime": p.stat().st_mtime})
     for it in items:
         d = docs.get(it["k"], {})
-        it.update({f: d.get(f) for f in ("cur_ratio", "max_ratio", "opens", "active_sec", "last_open", "done_at", "last_device", "revised_at")})
+        it.update({f: d.get(f) for f in ("cur_ratio", "max_ratio", "opens", "active_sec", "last_open", "done_at", "last_device", "revised_at",
+                                         "blk_total", "blk_read", "blk_new", "read_pct")})
+        it["prog"] = it["read_pct"] if it["read_pct"] is not None else (it["max_ratio"] or 0)  # 덩어리 단위 읽음이 있으면 그것, 없으면 옛 스크롤 깊이
         it["marks"] = nmarks.get(it["k"], 0)
         it["revised"] = bool(it["revised_at"] and it["revised_at"] > (it["last_open"] or 0))
-        it["state"] = "done" if it["done_at"] else ("reading" if (it["max_ratio"] or 0) >= 0.02 else "unread")
+        it["state"] = "done" if it["done_at"] else ("reading" if it["prog"] >= 0.02 else "unread")
     return items
 
 
 # ---------- API ----------
 
-def doc_payload(c, k):
+def doc_payload(c, k, blocks=False):
     d = c.execute("SELECT * FROM docs WHERE key=?", (k,)).fetchone()
     marks = [dict(r) for r in c.execute("SELECT * FROM marks WHERE key=? ORDER BY ratio", (k,))]
-    return {"doc": dict(d) if d else None, "marks": marks}
+    out = {"doc": dict(d) if d else None, "marks": marks}
+    if blocks:  # 페이지를 열 때만: 이 문서에서 본 적 있는 덩어리(h)와 읽음 여부. 처음 본 때가 첫 방문보다 2분 넘게 늦으면 '새로 바뀐 곳'
+        rows = c.execute("SELECT h, first_seen, read_at FROM blocks WHERE key=?", (k,)).fetchall()
+        base = min((r["first_seen"] for r in rows), default=None)
+        out["blocks"] = {"base": base, "read": [r["h"] for r in rows if r["read_at"]],
+                         "fresh": [r["h"] for r in rows if not r["read_at"] and base and r["first_seen"] > base + 120],
+                         "known": [r["h"] for r in rows if not r["read_at"]]}
+    return out
 
 
 def save_doc(c, b):
@@ -270,8 +281,17 @@ def save_doc(c, b):
             vid = c.execute("INSERT INTO visits(key, device, opened_at, max_ratio) VALUES(?,?,?,?)", (k, dev, now, ratio)).lastrowid
         elif vid:
             c.execute("UPDATE visits SET active_sec=active_sec+?, max_ratio=max(max_ratio, ?) WHERE id=? AND key=?", (act, ratio, vid, k))
-        # 끝까지 내려가 15초 넘게 봤으면 자동 완료(사용자가 되돌렸으면 다시 안 건다)
-        c.execute("UPDATE docs SET done_at=? WHERE key=? AND done_at IS NULL AND done_off=0 AND max_ratio>=0.95 AND active_sec>=15", (now, k))
+        # 덩어리 단위 읽음: seen = 처음 화면에 나타난 덩어리, reads = 충분히 머물러 읽음으로 확정된 덩어리
+        c.executemany("INSERT OR IGNORE INTO blocks(key, h, first_seen) VALUES(?,?,?)", [(k, str(h)[:40], now) for h in (b.get("seen") or [])[:20000]])
+        c.executemany("INSERT INTO blocks(key, h, first_seen, read_at) VALUES(?,?,?,?) ON CONFLICT(key, h) DO UPDATE SET read_at=coalesce(read_at, excluded.read_at)",
+                      [(k, str(h)[:40], now, now) for h in (b.get("reads") or [])[:20000]])
+        cov = b.get("cov")
+        if isinstance(cov, dict):
+            c.execute("UPDATE docs SET blk_total=?, blk_read=?, blk_new=?, read_pct=? WHERE key=?",
+                      (int(cov.get("total") or 0), int(cov.get("read") or 0), int(cov.get("new") or 0), max(0.0, min(1.0, float(cov.get("pct") or 0))), k))
+        # 자동 완료: 덩어리 기록이 있으면 97% 넘게 읽었을 때, 없으면 끝까지 내려가 15초 넘게 봤을 때(사용자가 되돌렸으면 다시 안 건다)
+        c.execute("""UPDATE docs SET done_at=? WHERE key=? AND done_at IS NULL AND done_off=0 AND
+                     (CASE WHEN read_pct IS NOT NULL THEN read_pct>=0.97 ELSE max_ratio>=0.95 AND active_sec>=15 END)""", (now, k))
     return {"visit": vid, **doc_payload(c, k)}
 
 
@@ -686,7 +706,7 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/__reader/api/doc":
             c, k = db(), nfc(q.get("k", ""))
             revise(c, [k])
-            return self.json(doc_payload(c, k))
+            return self.json(doc_payload(c, k, blocks=True))
         if u.path == "/__reader/api/list":
             c = db()
             return self.json({"items": merged(c), "marks": [dict(r) for r in c.execute("SELECT * FROM marks ORDER BY created_at DESC")]})
@@ -1383,8 +1403,10 @@ def ago(t):
 
 
 def line(it):
-    pct = "완료" if it["done_at"] else f"{round((it['max_ratio'] or 0) * 100)}%"
+    pct = "완료" if it["done_at"] else f"{round((it['prog'] or 0) * 100)}%"
     pct += " · 고쳐짐" if it.get("revised") else ""
+    if it.get("blk_total") and not it["done_at"]:
+        pct += f" · 안 읽은 덩어리 {it['blk_total'] - (it['blk_read'] or 0)}" + (f"(바뀐 곳 {it['blk_new']})" if it.get("blk_new") else "")
     extra = f" · {it['last_device']} {ago(it['last_open'])}" if it["last_open"] else ""
     marks = f" · 책갈피 {it['marks']}" if it["marks"] else ""
     return f"- [{pct}] {it['title']} ({it['k']}){extra}{marks}"
@@ -1428,7 +1450,8 @@ def cli(a):
             pth = Path(path).expanduser()
             k = key_of(pth) if pth.exists() else nfc(path).strip("/")
             with LOCK, c:
-                n = c.execute("UPDATE docs SET done_at=NULL, done_off=0, max_ratio=0, revised_at=? WHERE key=?", (time.time(), k)).rowcount
+                n = c.execute("UPDATE docs SET done_at=NULL, done_off=0, max_ratio=0, read_pct=0, blk_read=0, revised_at=? WHERE key=?", (time.time(), k)).rowcount
+                c.execute("UPDATE blocks SET read_at=NULL WHERE key=?", (k,))
             print(f"{'초기화' if n else '기록 없음'}: {k}")
     elif a.cmd == "explains":
         c = db()
@@ -1660,6 +1683,14 @@ TRACKER_JS = r"""
     :host{--bg:#fff;--fg:#1d1d1f;--mu:#6e6e73;--ac:#2f6fed;--ln:#e3e3e8}
     @media (prefers-color-scheme:dark){:host{--bg:#1f1f22;--fg:#f2f2f5;--mu:#a1a1a8;--ac:#6c9cff;--ln:#3a3a40}}
     *{box-sizing:border-box;font:13px/1.45 -apple-system,system-ui,"Apple SD Gothic Neo",sans-serif}
+    .rg{position:fixed;inset:0;pointer-events:none;overflow:hidden}.rg>i{position:absolute;left:0;top:0;width:100%;height:0}
+    .rg b{position:absolute;width:3px;border-radius:2px;transition:background .6s,opacity .6s}.rg b.r{background:#22a35a;opacity:.5}
+    .rg b.u{background:#9aa0a6;opacity:.28}.rg b.n{background:#f5b301;width:4px;opacity:.95}
+    .rg s{position:absolute;background:#f5b3011a;border-radius:6px;text-decoration:none}
+    .rg b.now{animation:rbnow 1.2s ease-out}@keyframes rbnow{0%{background:#f5b301;opacity:1;box-shadow:0 0 0 4px #22a35a55}100%{opacity:.5}}
+    .rl{position:fixed;right:1px;top:3px;bottom:0;width:7px;cursor:pointer;opacity:.85}.rl:hover{width:12px;opacity:1}
+    .rl b{position:absolute;left:0;width:100%;border-radius:1px;pointer-events:none}.rl b.r{background:#22a35a99}.rl b.u{background:#9aa0a644}.rl b.n{background:#f5b301}
+    .rl i{position:absolute;left:-1px;right:-1px;border:1.5px solid var(--ac);border-radius:3px;pointer-events:none}
     .bar{position:fixed;left:0;top:0;height:3px;width:100vw;pointer-events:none}
     .bar i{position:absolute;left:0;top:0;height:3px;background:var(--ac);transition:width .2s}
     .bar b{position:absolute;top:0;height:3px;width:2px;background:var(--mu)}
@@ -1853,6 +1884,7 @@ TRACKER_JS = r"""
     @media (max-width:600px){.ov{padding:0 0 40px}.card{height:100%;border-radius:0;border:0}.card .sc{padding:16px 16px 40px}.card h1,.card h1 .tt{font-size:22px}
       .card .gal{grid-template-columns:repeat(2,minmax(0,1fr))}.card figure img{height:110px}}
   </style>
+  <div class="rg"><i></i></div><div class="rl" title="문서 지도: 초록 읽음 · 회색 안 읽음 · 노랑 바뀐 곳 (누르면 이동, n 다음 안 읽은 곳)"></div>
   <div class="bar"><i></i><b></b></div>
   <div class="toast" hidden></div>
   <div class="pan" hidden></div>
@@ -1876,8 +1908,8 @@ TRACKER_JS = r"""
 
   let D = null, M = [], visit = null, dirty = false, active = 0, lastAct = Date.now(), restored = false, userMoved = false;
   const post = (p, b) => fetch(API + p, {method: 'POST', body: JSON.stringify(b), keepalive: true}).then(r => r.json());
-  const body = extra => ({k: K, ratio: ratio(), anchor: anchor(), device: DEV, visit, active: Math.round(active), ...extra});
-  const take = j => { if (j.doc) D = j.doc; if (j.marks) M = j.marks; if (j.visit) visit = j.visit; paint(); };
+  const body = extra => ({k: K, ratio: ratio(), anchor: anchor(), device: DEV, visit, active: Math.round(active), ...rbBody(), ...extra});
+  const take = j => { if (j.doc) D = j.doc; if (j.marks) M = j.marks; if (j.visit) visit = j.visit; if (j.blocks) rbLoad(j.blocks); paint(); };
   const flush = beacon => {
     const b = body(); active = 0; dirty = false;
     if (beacon && navigator.sendBeacon) navigator.sendBeacon(API + 'doc', JSON.stringify(b)); else post('doc', b).then(take).catch(() => {});
@@ -1888,15 +1920,17 @@ TRACKER_JS = r"""
 
   function paint() {
     const r = ratio();
-    $('.bar i').style.width = (r * 100) + 'vw';
-    $('.bar b').style.left = ((D?.max_ratio || 0) * 100) + 'vw';
-    $('.fab').textContent = D?.done_at ? '✓' : pct(r);
+    $('.bar i').style.width = ((COV ? COV.pct : D?.max_ratio || 0) * 100) + 'vw';  // 채운 막대 = 읽은 양, 세로 눈금 = 지금 위치
+    $('.bar b').style.left = (r * 100) + 'vw';
+    $('.fab').textContent = D?.done_at ? '✓' : pct(COV ? COV.pct : r);
     if (!$('.pan').hidden) drawPanel();
   }
   function drawPanel() {
     const p = $('.pan');
     p.innerHTML = `<h4>${esc(document.title || K)}</h4>
-      <div class="mu">지금 ${pct(ratio())} · 최고 ${pct(D?.max_ratio)} · ${D?.opens || 1}회 · ${Math.round((D?.active_sec || 0) / 60)}분${D?.done_at ? ' · 완료' : ''}</div>
+      <div class="mu">${COV ? `읽음 ${pct(COV.pct)} · 안 읽은 덩어리 ${COV.total - COV.read}개${COV.new ? ` (바뀐 곳 ${COV.new})` : ''}` : `지금 ${pct(ratio())}`} · ${D?.opens || 1}회 · ${Math.round((D?.active_sec || 0) / 60)}분${D?.done_at ? ' · 완료' : ''}</div>
+      <div class="mu" style="font-size:12px">화면에 충분히 머문 덩어리만 읽음(초록)으로 칩니다. 고쳐진·새로 생긴 덩어리는 노랑.</div>
+      <div class="row"><button data-a="nu">다음 안 읽은 곳 (n)</button><button data-a="pu">이전 (N)</button></div>
       <div class="row"><button class="p" data-a="b">책갈피 (b)</button><button data-a="m">메모 (m)</button>
         <button data-a="d">${D?.done_at ? '완료 취소' : '읽음 표시'} (d)</button></div>
       <div class="row mu">기기 <button data-a="dev">${esc(DEV)} ✎</button><a href="/" style="margin-left:auto">대시보드 →</a></div>
@@ -2565,10 +2599,12 @@ TRACKER_JS = r"""
   }
 
   R.addEventListener('click', e => {
+    if (e.target.closest('.rl')) { const rl = $('.rl'), q = rl.getBoundingClientRect(), H = span() + (S ? S.clientHeight : innerHeight), vh = S ? S.clientHeight : innerHeight;
+      return scrollToY(Math.max(0, (e.clientY - q.top) / q.height * H - vh / 2)); }
     const a = e.target.closest('[data-a]')?.dataset.a, del = e.target.closest('[data-del]')?.dataset.del, mk = e.target.closest('.mk');
     if (e.target.closest('.fab')) { const p = $('.pan'); p.hidden = !p.hidden; if (!p.hidden) drawPanel(); return; }
     if (del) { e.stopPropagation(); if (confirm('책갈피 삭제?')) post('mark', {k: K, del}).then(take); return; }
-    if (a === 'b') addMark(false); else if (a === 'm') addMark(true); else if (a === 'd') toggleDone();
+    if (a === 'b') addMark(false); else if (a === 'm') addMark(true); else if (a === 'd') toggleDone(); else if (a === 'nu') nextUnread(1); else if (a === 'pu') nextUnread(-1);
     else if (a === 'dev') { const d = prompt('이 기기 이름', DEV); if (d) { setDev(d.trim()); drawPanel(); } }
     else if (mk) { const m = M.find(x => x.id == mk.dataset.id); if (m) goTo(JSON.parse(m.anchor || 'null'), m.ratio); }
   });
@@ -2576,7 +2612,7 @@ TRACKER_JS = r"""
     if (e.metaKey || e.ctrlKey || e.altKey || e.isComposing) return;
     const t = e.composedPath()[0] || e.target; if (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)) return;
     if (e.key === 'f' && !$('.ov').hidden) { e.preventDefault(); return setFull(!FULL, true); }
-    const f = {a: () => openAsk(anyPick()), e: () => explain(anyPick()), b: () => addMark(false), m: () => addMark(true), d: toggleDone, '[': () => jumpMark(-1), ']': () => jumpMark(1)}[e.key];
+    const f = {a: () => openAsk(anyPick()), e: () => explain(anyPick()), b: () => addMark(false), m: () => addMark(true), d: toggleDone, '[': () => jumpMark(-1), ']': () => jumpMark(1), n: () => nextUnread(1), N: () => nextUnread(-1)}[e.key];
     if (f) { e.preventDefault(); f(); }
   };
   addEventListener('keydown', onKey);
@@ -2594,12 +2630,107 @@ TRACKER_JS = r"""
   };
   hookDoc(document);
 
-  const onScroll = () => { dirty = true; lastAct = Date.now(); if (restored) userMoved = true; paint(); };
+  const onScroll = () => { dirty = true; lastAct = Date.now(); if (restored) userMoved = true; paint(); rbPos(); };
   ['pointerdown', 'keydown', 'touchstart', 'mousemove', 'wheel'].forEach(ev => addEventListener(ev, () => lastAct = Date.now(), {passive: true}));
   setInterval(() => { if (document.visibilityState === 'visible' && Date.now() - lastAct < 60000) active += 1; }, 1000);
   setInterval(() => { if (dirty || active >= 15) flush(false); }, 2000);
   addEventListener('pagehide', () => flush(true));
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flush(true); });
+
+  // ---------- 덩어리 단위 읽음 ----------
+  // 문단·그림·표 같은 덩어리를 내용으로 이름 붙인다(태그+글의 해시). 화면에 충분히 오래 머문 덩어리만 '읽음'으로 확정한다.
+  // 내용이 바뀌거나 새로 생긴 덩어리는 이름이 달라지므로 저절로 '안 읽음'이 되고, 첫 방문 뒤에 생긴 것은 '바뀐 곳'(노랑)으로 칠한다.
+  // 문서 DOM은 건드리지 않고(화면 반영 비교가 깨지지 않게) 그림자 DOM 위에 줄을 그린다.
+  const RBSEL = 'h1,h2,h3,h4,h5,h6,p,li,pre,blockquote,figure,table,dt,dd,img,svg,iframe,video,canvas';
+  const RBMEDIA = /^(FIGURE|IMG|SVG|svg|IFRAME|VIDEO|CANVAS|TABLE)$/;
+  let BL = [], RD = new Set(), KN = new Set(), FR = new Set(), RBASE = null, PEND = new Set(), SEENP = [], COV = null, RBVIS = new Map(), RBIO = null, RBT = 0;
+  const fnv = s => { let h = 0x811c9dc5; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return (h >>> 0).toString(36); };
+  const bKey = el => {
+    const tg = el.tagName.toUpperCase();
+    if (tg === 'IMG') return 'img:' + (el.getAttribute('src') || '').slice(-160) + (el.alt || '');
+    if (tg === 'IFRAME') { const sd = el.getAttribute('srcdoc'); return 'if:' + (sd ? fnv(sd) + sd.length : el.getAttribute('src') || ''); }
+    const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+    const im = el.querySelectorAll ? [...el.querySelectorAll('img')].map(i => (i.getAttribute('src') || '').slice(-80)).join(',') : '';
+    return tg + ':' + (t.length > 6000 ? t.slice(0, 3000) + t.length + t.slice(-3000) : t) + im + (!t && !im ? el.outerHTML.slice(0, 4000) : '');
+  };
+  function rbScan() {
+    const all = [...document.body.querySelectorAll(RBSEL)], set = new Set(all), cnt = new Map(), out = [], newSeen = [];
+    for (const el of all) {
+      let nested = false; for (let p = el.parentElement; p && p !== document.body; p = p.parentElement) if (set.has(p)) { nested = true; break; }
+      if (nested) continue;
+      const r = el.getBoundingClientRect(); if (r.height < 4 || r.width < 4) continue;  // 접힌 details 안·숨은 것은 세지 않는다
+      const k0 = bKey(el); const t = el.tagName.toUpperCase();
+      if (!RBMEDIA.test(t) && k0.length < t.length + 3) continue;  // 빈 문단
+      const base = t + fnv(k0), n = cnt.get(base) || 0; cnt.set(base, n + 1);
+      const h = n ? base + '.' + n : base;  // 똑같은 덩어리가 여럿이면 순번
+      const len = (el.textContent || '').replace(/\s+/g, '').length, media = RBMEDIA.test(t) && len < 400;
+      out.push({el, h, w: media ? Math.max(250, len) : Math.min(Math.max(len, 30), 3000), need: media ? 2000 : Math.min(Math.max(len * 25, 1200), 7000), dw: 0});
+      if (!KN.has(h)) { KN.add(h); newSeen.push(h); if (RBASE && Date.now() / 1000 - RBASE > 120 && !RD.has(h)) FR.add(h); }
+    }
+    const old = new Map(BL.map(b => [b.h, b.dw])); out.forEach(b => b.dw = old.get(b.h) || 0);  // 다시 셀 때 머문 시간 유지
+    BL = out; if (newSeen.length) { SEENP.push(...newSeen); if (!RBASE) RBASE = Date.now() / 1000; dirty = true; }
+    RBIO?.disconnect(); RBVIS.clear();
+    RBIO = new IntersectionObserver(es => es.forEach(e => RBVIS.set(e.target, e.isIntersecting ? e.intersectionRect.height : 0)), {threshold: [0, .1, .25, .4, .6, .8, 1]});
+    BL.forEach(b => RBIO.observe(b.el));
+    rbCov(); rbDraw();
+  }
+  function rbCov() {
+    let tw = 0, rw = 0, nr = 0, nf = 0;
+    for (const b of BL) { tw += b.w; if (RD.has(b.h)) { rw += b.w; nr++; } else if (FR.has(b.h)) nf++; }
+    const c = {total: BL.length, read: nr, new: nf, pct: tw ? Math.round(rw / tw * 1000) / 1000 : 0};
+    if (!COV || c.read !== COV.read || c.total !== COV.total || c.new !== COV.new) { COV = c; dirty = true; }
+    paint();
+  }
+  // 0.5초마다: 화면에 충분히 보이는 안 읽은 덩어리 중 맨 위 것 하나에만 시간을 준다(위에서부터 차례로 읽는다고 본다)
+  setInterval(() => {
+    if (document.visibilityState !== 'visible' || Date.now() - lastAct > 60000 || !$('.ov').hidden || !BL.length) return;
+    let cur = null, ct = Infinity;
+    for (const b of BL) {
+      if (RD.has(b.h)) continue; const vh = RBVIS.get(b.el); if (!vh) continue;
+      const bh = b.el.getBoundingClientRect(); if (vh < Math.min(bh.height * 0.6, innerHeight * 0.45)) continue;
+      if (bh.top < ct) { ct = bh.top; cur = b; }
+    }
+    if (!cur) return;
+    cur.dw += 500;
+    if (cur.dw >= cur.need) { RD.add(cur.h); PEND.add(cur.h); FR.delete(cur.h); rbCov(); rbDraw(cur.h); }
+  }, 500);
+  const rbBody = () => { const o = {}; if (PEND.size) { o.reads = [...PEND]; PEND.clear(); } if (SEENP.length) { o.seen = SEENP.splice(0); } if (COV) o.cov = COV; return o; };
+  const rbLoad = x => { RBASE = x.base || null; RD = new Set(x.read || []); KN = new Set([...(x.read || []), ...(x.known || [])]); FR = new Set(x.fresh || []); };
+  // 그리기: 덩어리 왼쪽 여백에 세로 줄(읽음 초록·안 읽음 회색·바뀐 곳 노랑+옅은 칠), 오른쪽 끝에 문서 전체 지도
+  const docY = r => r.top - viewTop() + top();
+  function rbDraw(justRead) {
+    const g = $('.rg i'), rl = $('.rl'); if (!g) return;
+    const H = Math.max(1, span() + (S ? S.clientHeight : innerHeight)), RH = rl.clientHeight || innerHeight;
+    const runs = [];
+    for (const b of BL) {
+      const r = b.el.getBoundingClientRect(), st = RD.has(b.h) ? 'r' : FR.has(b.h) ? 'n' : 'u', y0 = docY(r), y1 = y0 + r.height, L = runs.at(-1);
+      if (L && L.st === st && y0 - L.y1 < 48 && !(justRead && b.h === justRead)) { L.y1 = Math.max(L.y1, y1); L.x = Math.min(L.x, r.left); L.x2 = Math.max(L.x2, r.right); }
+      else runs.push({st, y0, y1, x: r.left, x2: r.right, fresh: justRead && b.h === justRead});
+    }
+    g.innerHTML = runs.map(u => `<b class="${u.st}${u.fresh ? ' now' : ''}" style="top:${u.y0}px;height:${u.y1 - u.y0}px;left:${Math.max(2, u.x - 12)}px"></b>`
+      + (u.st === 'n' ? `<s style="top:${u.y0 - 2}px;height:${u.y1 - u.y0 + 4}px;left:${Math.max(0, u.x - 6)}px;width:${u.x2 - u.x + 12}px"></s>` : '')).join('');
+    rl.innerHTML = runs.map(u => `<b class="${u.st}" style="top:${u.y0 / H * RH}px;height:${Math.max(2, (u.y1 - u.y0) / H * RH)}px"></b>`).join('') + '<i></i>';
+    rbPos();
+  }
+  function rbPos() {
+    const g = $('.rg i'); if (g) g.style.transform = `translateY(${viewTop() - top()}px)`;
+    const v = $('.rl i'); if (v) { const H = Math.max(1, span() + (S ? S.clientHeight : innerHeight)), RH = $('.rl').clientHeight || innerHeight, vh = S ? S.clientHeight : innerHeight;
+      v.style.top = (top() / H * RH) + 'px'; v.style.height = Math.max(6, vh / H * RH) + 'px'; }
+  }
+  // 다음(n)·이전(N) 안 읽은 곳으로. 바뀐 곳이 있으면 그것부터
+  function nextUnread(dir) {
+    const y = top() + (S ? S.clientHeight : innerHeight) * 0.3, un = BL.filter(b => !RD.has(b.h));
+    if (!un.length) return toast('안 읽은 곳이 없습니다', 2000);
+    const pick = list => { const ys = list.map(b => ({b, y: docY(b.el.getBoundingClientRect())}));
+      return dir > 0 ? (ys.find(o => o.y > y + 4) || ys[0]) : ([...ys].reverse().find(o => o.y < y - 4) || ys.at(-1)); };
+    const fr = un.filter(b => FR.has(b.h)), o = pick(fr.length ? fr : un);
+    scrollToY(Math.max(0, o.y - (S ? S.clientHeight : innerHeight) * 0.3));
+    toast(`${FR.has(o.b.h) ? '바뀐 곳' : '안 읽은 곳'} · 남은 ${un.length}개${fr.length ? ` (바뀐 곳 ${fr.length})` : ''}`, 1800);
+  }
+  let rbTo = 0; const rbLater = (ms = 700) => { clearTimeout(rbTo); rbTo = setTimeout(rbScan, ms); };
+  new MutationObserver(() => rbLater()).observe(document.body, {childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['open', 'src', 'hidden', 'srcdoc']});
+  addEventListener('resize', () => rbLater(300));
+  try { new ResizeObserver(() => rbLater(500)).observe(document.body); } catch {}
 
   async function start() {
     document.documentElement.append(host);
@@ -2618,7 +2749,9 @@ TRACKER_JS = r"""
       setTimeout(() => { if (!userMoved) goTo(a, prev.cur_ratio); }, 900);  // 늦게 그려지는 그림 대비
       toast(`이어 읽기 · ${pct(prev.cur_ratio)} <span style="color:var(--mu)">(${esc(prev.last_device || '')} ${ago(prev.updated_at)})</span>`, 6000, [['맨 위로', () => scrollToY(0)]]);
     }
-    if (revised) setTimeout(() => toast('문서가 고쳐져 읽음 표시를 초기화했습니다', 5000), h || prev.cur_ratio > 0.02 ? 6200 : 300);
+    setTimeout(rbScan, 300);
+    if (revised) setTimeout(() => { const n = BL.filter(b => FR.has(b.h)).length;
+      toast(n ? `문서가 고쳐졌습니다 · 바뀐 곳 ${n}군데는 노란 줄` : '문서가 고쳐졌습니다', 6000, n ? [['바뀐 곳으로 (n)', () => nextUnread(1)]] : []); }, h || prev.cur_ratio > 0.02 ? 6200 : 1500);
     setTimeout(() => { restored = true; }, 1200);
     restoreAsk();
     post('doc', body({open: true, title: document.title})).then(take).catch(() => {});
@@ -2689,19 +2822,20 @@ function docs() {
     && (!q || (i.title + ' ' + i.k).toLowerCase().includes(q)));
   const s = sort.value;
   if (s === 'recent') xs.sort((a, b) => (b.last_open || 0) - (a.last_open || 0));
-  if (s === 'pct') xs.sort((a, b) => (b.max_ratio || 0) - (a.max_ratio || 0));
+  if (s === 'pct') xs.sort((a, b) => (b.prog || 0) - (a.prog || 0));
   if (s === 'new') xs.sort((a, b) => b.mtime - a.mtime);
   if (!xs.length) return '<div class="empty">해당 문서 없음</div>';
   let out = '', last = '';
   for (const i of xs) {
     const g = s === 'group' ? i.group + ' · ' + i.folder : '';
     if (g && g !== last) { out += `<h3>${esc(g)}</h3>`; last = g; }
-    const done = !!i.done_at, r = done ? 1 : (i.max_ratio || 0);
+    const done = !!i.done_at, r = done ? 1 : (i.prog || 0);
     const meta = [i.last_open ? `${esc(i.last_device || '')} ${ago(i.last_open)}` : '안 열어 봄',
       i.opens ? i.opens + '회' : '', i.active_sec ? Math.round(i.active_sec / 60) + '분' : '',
       i.marks ? '책갈피 ' + i.marks : '', s !== 'group' ? esc(i.folder) : '',
+      i.blk_total && !done ? `안 읽은 덩어리 ${i.blk_total - (i.blk_read || 0)}${i.blk_new ? ` · 바뀐 곳 ${i.blk_new}` : ''}` : '',
       i.cur_ratio > 0.02 && !done ? `지금 위치 ${pct(i.cur_ratio)}` : ''].filter(Boolean).join(' · ');
-    out += `<div class="it"><a href="${href(i.k)}">${esc(i.title)}</a><span class="pct ${done ? 'done' : ''}">${i.revised ? '<span class="rv">고쳐짐</span> ' : ''}${done ? '완료' : pct(i.max_ratio)}</span>
+    out += `<div class="it"><a href="${href(i.k)}">${esc(i.title)}</a><span class="pct ${done ? 'done' : ''}">${i.revised ? '<span class="rv">고쳐짐</span> ' : ''}${done ? '완료' : pct(i.prog)}</span>
       <div class="track ${done ? 'done' : ''}"><i style="width:${r * 100}%"></i></div><div class="meta">${meta}</div></div>`;
   }
   return out;

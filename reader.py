@@ -702,11 +702,11 @@ class Handler(BaseHTTPRequestHandler):
             if q.get("id"):
                 r = c.execute("SELECT id, key, term, answer, created_at FROM explains WHERE id=?", (int(q["id"]),)).fetchone()
                 return self.json(dict(r) if r else {})
-            like = f"%{q.get('q', '')}%"
+            like, only = f"%{q.get('q', '')}%", nfc(q.get("k", "")).strip("/")
             rows = c.execute("""SELECT e.id, e.key, e.term, e.created_at, e.model, d.title FROM explains e
                 JOIN (SELECT max(id) id FROM explains WHERE q='' AND answer<>'' GROUP BY term, key) m ON m.id = e.id
-                LEFT JOIN docs d ON d.key = e.key WHERE e.term LIKE ? OR e.key LIKE ? OR ifnull(d.title,'') LIKE ?
-                ORDER BY e.id DESC LIMIT 400""", (like, like, like)).fetchall()
+                LEFT JOIN docs d ON d.key = e.key WHERE (e.term LIKE ? OR e.key LIKE ? OR ifnull(d.title,'') LIKE ?) AND (?='' OR e.key=?)
+                ORDER BY e.id DESC LIMIT 400""", (like, like, like, only, only)).fetchall()
             return self.json({"items": [dict(r) for r in rows]})
         if u.path == "/__reader/api/images":
             return self.json({"items": wiki_images(q.get("t", "").split("|"))})
@@ -950,7 +950,10 @@ def creator(key, refresh=False):
     c = db()
     r = c.execute("SELECT creator_session, creator_cwd, creator_n, creator_mtime, ask_session FROM docs WHERE key=?", (key,)).fetchone()
     if r and r[0] is not None and not refresh:
-        return {"sid": r[0], "cwd": r[1], "n": r[2], "mtime": r[3], "fork": r[4]} if r[0] else None
+        if not r[0]:
+            return None
+        if (PROJECTS / _slug(r[1] or ROOT) / f"{r[0]}.jsonl").exists():  # 세션 기록이 지워졌거나 옮겨졌으면 다시 찾는다
+            return {"sid": r[0], "cwd": r[1], "n": r[2], "mtime": r[3], "fork": r[4]}
     info = find_creator(key)
     with LOCK, c:
         if not r:
@@ -960,45 +963,100 @@ def creator(key, refresh=False):
     return dict(info, fork=None) if info else None
 
 
-def session_run(extra, prompt, cwd, on_text, on_tool=None, timeout=900):
-    """claude -p를 cwd에서 돌린다(이어받기 인자는 extra). (새 세션 id, 답, 오류)를 돌려준다."""
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDECODE", "CLAUDE_CODE_"))}
-    proc = subprocess.Popen([CLAUDE, "-p", "--model", DEEP_MODEL, "--output-format", "stream-json", "--verbose", "--include-partial-messages", *extra, prompt],
-                            cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    timer = threading.Timer(timeout, proc.kill); timer.start()
-    sid, out, err = None, [], ""
+def _alive(pid):
     try:
-        for ln in proc.stdout:
-            try:
-                ev = json.loads(ln)
-            except ValueError:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _killpg(pid):
+    try:
+        os.killpg(os.getpgid(pid), 9)
+    except OSError:
+        try:
+            os.kill(pid, 9)
+        except OSError:
+            pass
+
+
+def _tail_lines(path, alive):
+    """파일에 쌓이는 줄을 따라 읽는다. alive()가 거짓이 되면 남은 줄까지 읽고 끝."""
+    with open(path, errors="ignore") as fh:
+        buf = ""
+        while True:
+            ln = fh.readline()
+            if ln:
+                buf += ln
+                if buf.endswith("\n"):
+                    yield buf; buf = ""
                 continue
-            t = ev.get("type")
-            if t == "system" and ev.get("subtype") == "init":
-                sid = ev.get("session_id")
-            elif t == "stream_event":
-                e = ev.get("event") or {}
-                if e.get("type") == "content_block_delta" and e.get("delta", {}).get("type") == "text_delta":
-                    out.append(e["delta"]["text"]); on_text(e["delta"]["text"])
-            elif t == "assistant" and on_tool:
-                for blk in (ev.get("message") or {}).get("content") or []:
-                    if blk.get("type") == "tool_use":
-                        if out and not out[-1].endswith("\n\n"):  # 도구를 쓰고 이어 쓰는 글이 앞 글에 붙지 않게
-                            out.append("\n\n"); on_text("\n\n")
-                        inp = blk.get("input") or {}
-                        arg = next((str(inp[k]) for k in TOOL_ARG if inp.get(k)), "")
-                        on_tool(blk.get("name", ""), arg.replace(str(ROOT) + "/", "")[:160])
-            elif t == "result":
-                sid = ev.get("session_id") or sid
-                if ev.get("is_error"):
-                    err = str(ev.get("result") or "오류")[:300]
+            if not alive():
+                yield from (buf + fh.read()).splitlines()
+                return
+            time.sleep(0.15)
+
+
+def _parse_stream(lines, on_text, on_tool=None, on_init=None):
+    sid, out, err = None, [], ""
+    for ln in lines:
+        try:
+            ev = json.loads(ln)
+        except ValueError:
+            continue
+        t = ev.get("type")
+        if t == "system" and ev.get("subtype") == "init":
+            sid = ev.get("session_id")
+            if on_init and sid:
+                on_init(sid)
+        elif t == "stream_event":
+            e = ev.get("event") or {}
+            if e.get("type") == "content_block_delta" and e.get("delta", {}).get("type") == "text_delta":
+                out.append(e["delta"]["text"]); on_text(e["delta"]["text"])
+        elif t == "assistant" and on_tool:
+            for blk in (ev.get("message") or {}).get("content") or []:
+                if blk.get("type") == "tool_use":
+                    if out and not out[-1].endswith("\n\n"):  # 도구를 쓰고 이어 쓰는 글이 앞 글에 붙지 않게
+                        out.append("\n\n"); on_text("\n\n")
+                    inp = blk.get("input") or {}
+                    arg = next((str(inp[k]) for k in TOOL_ARG if inp.get(k)), "")
+                    on_tool(blk.get("name", ""), arg.replace(str(ROOT) + "/", "")[:160])
+        elif t == "result":
+            sid = ev.get("session_id") or sid
+            if ev.get("is_error"):
+                err = str(ev.get("result") or "오류")[:300]
+    return sid, out, err
+
+
+def session_run(extra, prompt, cwd, on_text, on_tool=None, timeout=900, on_init=None, log=None, on_pid=None):
+    """claude -p를 cwd에서 돌린다(이어받기 인자는 extra). (새 세션 id, 답, 오류)를 돌려준다.
+    log를 주면 출력을 그 파일에 쓰고 claude를 따로 된 프로세스 그룹으로 띄운다: 리더 서버가 재시작돼도 claude는 계속 돌고 서버가 파일을 다시 이어 읽는다."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDECODE", "CLAUDE_CODE_"))}
+    cmd = [CLAUDE, "-p", "--model", DEEP_MODEL, "--output-format", "stream-json", "--verbose", "--include-partial-messages", *extra, prompt]
+    if log:
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with open(log, "w") as fo, open(str(log) + ".err", "w") as fe:
+            proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=fo, stderr=fe, start_new_session=True)
+        if on_pid:
+            on_pid(proc.pid)
+        lines = _tail_lines(log, lambda: proc.poll() is None)
+    else:
+        proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        lines = proc.stdout
+    timer = threading.Timer(timeout, lambda: _killpg(proc.pid) if log else proc.kill()); timer.start()
+    try:
+        sid, out, err = _parse_stream(lines, on_text, on_tool, on_init)
         proc.wait()
+        if err in ("", "오류") and log and not out:  # 결과 줄에 이유가 없으면 claude가 stderr에 남긴 이유를 쓴다
+            err = Path(str(log) + ".err").read_text(errors="ignore").strip()[-300:] or err
         if not out and not err and proc.returncode:
-            err = (proc.stderr.read() or "").strip()[-300:] or f"claude 종료 코드 {proc.returncode}"
+            tail = Path(str(log) + ".err").read_text(errors="ignore") if log else (proc.stderr.read() or "")
+            err = tail.strip()[-300:] or f"claude 종료 코드 {proc.returncode}"
     finally:
         timer.cancel()
         if proc.poll() is None:
-            proc.kill()
+            _killpg(proc.pid) if log else proc.kill()
     return sid, "".join(out), err
 
 
@@ -1015,18 +1073,91 @@ ASK_RULE = {
 }
 
 
+EDIT_ACTIVE, EDIT_CV = {}, threading.Condition()
+JOBDIR = DB.parent / "jobs"  # 질문·수정 작업 기록: <id>.json(요청·pid·끝 결과) + <id>.out(claude 출력). 서버가 재시작돼도 여기서 이어 받는다
+
+
+def _job_meta(jid, upd):
+    f = JOBDIR / f"{jid}.json"
+    JOBDIR.mkdir(parents=True, exist_ok=True)
+    try:
+        cur = json.loads(f.read_text()) if f.exists() else {}
+    except ValueError:
+        cur = {}
+    cur.update(upd)
+    f.write_text(json.dumps(cur, ensure_ascii=False))
+
+
+def _ask_resume(jid, push):
+    """서버가 다시 켜진 뒤: 기록된 작업을 출력 파일 처음부터 다시 읽어 보내고, claude가 아직 돌면 끝날 때까지 따라간다."""
+    m = json.loads((JOBDIR / f"{jid}.json").read_text())
+    p = resolve(m["k"])[0]
+    push({"e": "meta", "how": m.get("how"), "sid": m.get("sid"), "mode": m.get("mode")})
+    if m.get("final"):
+        _parse_stream(_tail_lines(m["log"], lambda: False), lambda t: push({"e": "text", "d": t}), lambda n, a: push({"e": "tool", "name": n, "arg": a}))
+        return push(m["final"])
+    push({"e": "note", "msg": "리더 서버가 다시 켜져 돌던 작업을 이어 받습니다"})
+    pid, stop = m.get("pid") or 0, threading.Event()
+    if m.get("mode") == "edit" and p:
+        if p.stat().st_mtime != m.get("mt0"):
+            push({"e": "file", "t": p.stat().st_mtime})
+
+        def watch(last=p.stat().st_mtime):
+            while not stop.wait(0.5):
+                try:
+                    if p.stat().st_mtime != last:
+                        time.sleep(0.3); last = p.stat().st_mtime; push({"e": "file", "t": last})
+                except OSError:
+                    pass
+        threading.Thread(target=watch, daemon=True).start()
+    _, out, err = _parse_stream(_tail_lines(m["log"], lambda: pid and _alive(pid)), lambda t: push({"e": "text", "d": t}),
+                                lambda n, a: push({"e": "tool", "name": n, "arg": a}))
+    stop.set()
+    changed = bool(p and p.exists() and p.stat().st_mtime != m.get("mt0"))
+    fin = {"e": "err", "msg": err or "작업이 중간에 끊겼습니다"} if not out else {"e": "done", "changed": changed, "sec": round(time.time() - m.get("t0", time.time())), "how": m.get("how"), "err": err}
+    _job_meta(jid, {"final": fin})
+    push(fin)  # 폴더별로 돌고 있는 수정 요청(같은 덩어리는 줄 세우고, 다른 덩어리는 동시에)
+
+
 def _ask_run(b, push):
+    """한 창(스레드)의 요청 하나. 창마다 자기 세션 갈래를 가져 여러 창이 동시에 돈다.
+    질문은 모두 동시에, 수정은 다른 덩어리끼리 동시에·같은 덩어리는 먼저 온 순서로(중재). 빌드는 폴더 잠금으로 한 번에 하나."""
     k, mode = b["k"], ("edit" if b.get("mode") == "edit" else "ask")
-    lk = SESS_LK.setdefault(k, threading.Lock())
-    if lk.locked():
-        push({"e": "note", "msg": "이 문서에 먼저 보낸 요청이 끝나길 기다리는 중"})
-    with lk:
-        t0, info = time.time(), creator(k)
-        p = resolve(k)[0]
+    thread = re.sub(r"[^A-Za-z0-9-]", "", str(b.get("thread") or ""))[:64]
+    t0, info = time.time(), creator(k)
+    p = resolve(k)[0]
+    folder = str(p.parent) if p else k
+    me = {"id": str(b.get("id") or ""), "blk": str(b.get("blk") or "")[:200], "sel": (b.get("sel") or "")[:100], "q": b["q"].strip()[:100]}
+    others = []
+    if mode == "edit":
+        with EDIT_CV:
+            told = False
+            while any(o["blk"] and o["blk"] == me["blk"] for o in EDIT_ACTIVE.get(folder, [])):
+                n = sum(1 for o in EDIT_ACTIVE[folder] if o["blk"] == me["blk"])
+                if not told:
+                    push({"e": "queue", "n": n}); push({"e": "note", "msg": f"같은 덩어리를 고치는 요청 {n}개가 먼저 돌고 있어 끝나길 기다립니다"}); told = True
+                EDIT_CV.wait(5)
+            others = list(EDIT_ACTIVE.get(folder, []))
+            EDIT_ACTIVE.setdefault(folder, []).append(me)
+        if told:
+            push({"e": "note", "msg": "차례가 와서 시작합니다"})
+    lk = SESS_LK.setdefault(thread, threading.Lock()) if thread else None
+    if lk and lk.locked():
+        push({"e": "note", "msg": "이 창의 앞 요청이 끝나면 이어서 묻습니다"})
+    if lk:
+        lk.acquire()
+    try:
         mt0 = p.stat().st_mtime if p else 0
+        rule = ASK_RULE[mode]
+        if mode == "edit":
+            lock = f"uv run --quiet {Path(__file__).resolve()} lock {folder} -- <빌드 명령>"
+            rule += (f" 빌드 명령은 반드시 `{lock}` 형태로 감싸 돌린다(여러 요청이 동시에 빌드하지 않게). "
+                     "파일 전체를 Write로 덮어쓰지 말고 Edit로 필요한 부분만 고친다. 'modified since read' 오류가 나면 다시 읽고 고친다.")
+            if others:
+                rule += " 지금 같은 문서의 다른 곳을 동시에 고치는 요청이 있다. 그 부분은 건드리지 않는다: " + " / ".join(f"«{o['sel']}»({o['q']})" for o in others)
         prompt = "\n".join([f"[WIM Reader에서 보낸 {'질문' if mode == 'ask' else 'HTML 수정 요청'}]", f"문서: {p or k}",
                              f"절: {b.get('head', '')[:200]}", f"사용자가 고른 부분: «{(b.get('sel') or '')[:2000]}»",
-                             f"주변 글: «{(b.get('ctx') or '')[:1500]}»", "", b["q"].strip()[:4000], "", ASK_RULE[mode]])
+                             f"주변 글: «{(b.get('ctx') or '')[:1500]}»", "", b["q"].strip()[:4000], "", rule])
         tools = (["--tools", "Read,Grep,Glob,WebSearch,WebFetch", "--setting-sources", ""] if mode == "ask" else []) + ["--permission-mode", "bypassPermissions"]
         stop = threading.Event()
 
@@ -1045,35 +1176,42 @@ def _ask_run(b, push):
         if p and mode == "edit":
             threading.Thread(target=watch, daemon=True).start()
         for attempt in range(2):
-            fork, cwd = (info or {}).get("fork"), (info or {}).get("cwd") or str(ROOT)
-            if fork and (PROJECTS / _slug(cwd) / f"{fork}.jsonl").exists():
-                how, res = "cont", ["--resume", fork]
+            cwd = (info or {}).get("cwd") or str(ROOT)
+            if thread and (PROJECTS / _slug(cwd) / f"{thread}.jsonl").exists():
+                how, res = "cont", ["--resume", thread]
             elif info:
                 how, res = "fork", ["--resume", info["sid"], "--fork-session"]
             else:
                 how, res, cwd = "new", [], str(ROOT)
             push({"e": "meta", "how": how, "sid": info and info["sid"], "n": info and info["n"], "mtime": info and info["mtime"], "mode": mode})
+            jid = b.get("_jid") or pysecrets.token_hex(8)
+            meta = {"k": k, "mode": mode, "how": how, "sid": info and info["sid"], "mt0": mt0, "t0": t0, "log": str(JOBDIR / f"{jid}.out")}
             sid, out, err = session_run(res + tools, prompt, cwd, lambda t: push({"e": "text", "d": t}),
-                                        lambda n, a: push({"e": "tool", "name": n, "arg": a}), timeout=900 if mode == "edit" else 600)
-            if err and how == "cont" and not out and attempt == 0:  # 이어 묻던 갈래가 사라졌으면 만든 세션에서 다시 갈라 시작
-                c = db()
-                with LOCK, c:
-                    c.execute("UPDATE docs SET ask_session=NULL WHERE key=?", (k,))
-                info["fork"] = None
+                                        lambda n, a: push({"e": "tool", "name": n, "arg": a}), timeout=900 if mode == "edit" else 600,
+                                        on_init=(lambda x: push({"e": "thread", "sid": x})) if how != "cont" else None,
+                                        log=JOBDIR / f"{jid}.out", on_pid=lambda pid: _job_meta(jid, dict(meta, pid=pid)))
+            if err and how == "cont" and not out and attempt == 0:  # 이 창의 갈래가 사라졌으면 만든 세션에서 다시 갈라 시작
+                thread = ""
                 continue
             break
-        if sid and how in ("fork", "new") and not err:
+        if sid and how == "new" and not err:
             c = db()
             with LOCK, c:
-                if how == "new":
-                    c.execute("UPDATE docs SET creator_session=?, creator_cwd=?, creator_n=0, creator_mtime=? WHERE key=?", (sid, cwd, time.time(), k))
-                else:
-                    c.execute("UPDATE docs SET ask_session=? WHERE key=?", (sid, k))
+                c.execute("UPDATE docs SET creator_session=?, creator_cwd=?, creator_n=0, creator_mtime=? WHERE key=?", (sid, cwd, time.time(), k))
         stop.set()
         changed = bool(p and p.exists() and p.stat().st_mtime != mt0)
-        if err and not out:
-            return push({"e": "err", "msg": err})
-        push({"e": "done", "changed": changed, "sec": round(time.time() - t0), "how": how, "err": err})
+        fin = {"e": "err", "msg": err} if err and not out else {"e": "done", "changed": changed, "sec": round(time.time() - t0), "how": how, "err": err}
+        if b.get("_jid"):
+            _job_meta(b["_jid"], {"final": fin})
+        push(fin)
+    finally:
+        if lk:
+            lk.release()
+        if mode == "edit":
+            with EDIT_CV:
+                if me in EDIT_ACTIVE.get(folder, []):
+                    EDIT_ACTIVE[folder].remove(me)
+                EDIT_CV.notify_all()
 
 
 def _ask_handler(self, b):
@@ -1085,16 +1223,18 @@ def _ask_handler(self, b):
     with ASK_LK:
         job = ASK_JOBS.get(jid)
         attach = bool(job)
-        if not job and not b.get("resume_only"):
+        stored = not job and (JOBDIR / f"{jid}.json").exists()
+        if not job and (stored or not b.get("resume_only")):
             job = ASK_JOBS[jid] = {"evs": [], "done": False, "cv": threading.Condition()}
+            b["_jid"] = jid
 
             def push(ev, job=job):
                 with job["cv"]:
                     job["evs"].append(ev); job["cv"].notify_all()
 
-            def run(job=job, push=push):
+            def run(job=job, push=push, stored=stored):
                 try:
-                    _ask_run(b, push)
+                    _ask_resume(jid, push) if stored else _ask_run(b, push)
                 except Exception as e:  # noqa: BLE001
                     push({"e": "err", "msg": str(e)[:300]})
                 finally:
@@ -1116,9 +1256,11 @@ def _ask_handler(self, b):
         i = 0
         while True:
             with job["cv"]:
-                while i >= len(job["evs"]) and not job["done"]:
+                if i >= len(job["evs"]) and not job["done"]:
                     job["cv"].wait(15)
                 evs, fin = job["evs"][i:], job["done"]
+            if not evs and not fin:  # 심장 박동: 브라우저가 연결이 살아 있는지 안다
+                emit({"e": "hb"}); continue
             i += len(evs)
             for ev in evs:
                 emit(ev)
@@ -1163,6 +1305,9 @@ def lan_ip():
 
 
 def serve(a):
+    for f in JOBDIR.glob("*") if JOBDIR.is_dir() else []:
+        if f.stat().st_mtime < time.time() - 3 * 86400:
+            f.unlink(missing_ok=True)
     moved = migrate()
     for old, new in moved:
         print(f"경로 이전: {old} → {new}")
@@ -1389,11 +1534,21 @@ def main():
     o = sub.add_parser("open")
     o.add_argument("path", nargs="*")
     o.add_argument("--port", type=int, default=PORT)
+    lk = sub.add_parser("lock", help="폴더 잠금을 잡고 명령 실행(동시에 들어온 HTML 수정 요청들의 빌드를 한 번에 하나씩)")
+    lk.add_argument("dir")
+    lk.add_argument("command", nargs=argparse.REMAINDER)
     for n in ("install-agent", "uninstall-agent"):
         p = sub.add_parser(n)
         p.add_argument("--lan", action="store_true")
         p.add_argument("--port", type=int, default=PORT)
     a = ap.parse_args()
+    if a.cmd == "lock":
+        import fcntl
+        d = Path(a.dir).expanduser()
+        cmd = a.command[1:] if a.command[:1] == ["--"] else a.command
+        with open((d if d.is_dir() else d.parent) / ".wim_build.lock", "w") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            sys.exit(subprocess.run(cmd).returncode if cmd else 0)
     if a.cmd == "serve":
         serve(a)
     elif a.cmd == "open":
@@ -1525,6 +1680,10 @@ TRACKER_JS = r"""
     .ask button.p{background:var(--k-acc);border-color:var(--k-acc);color:var(--k-paper);font-weight:700;padding:5px 14px}
     .ask.edit button.p{background:var(--k-warn);border-color:var(--k-warn)}.ask button:disabled{opacity:.6}
     .card .q small{font-size:12px;color:var(--k-muted);font-weight:600}
+    .ask{z-index:1}.ask.focus{z-index:3}.ask .ms{display:none}
+    .ask.mini{cursor:pointer;box-shadow:0 6px 18px #0004}.ask.mini .qs,.ask.mini .th,.ask.mini form{display:none}
+    .ask.mini header{border-bottom:0}.ask.mini .si{display:none}.ask.mini .ms{display:block;flex:1;min-width:0;font-size:12px;color:var(--k-ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .ask.mini:hover{outline:2px solid color-mix(in srgb,var(--k-acc) 50%,transparent)}
     .ask.mv{transition:left .32s cubic-bezier(.2,.8,.2,1),top .32s cubic-bezier(.2,.8,.2,1),bottom .32s cubic-bezier(.2,.8,.2,1),width .32s ease,max-height .32s ease}
     .ask.side{width:min(380px,calc(100vw - 24px))}.ask.side .qs{max-height:2.9em;font-size:12px}.ask.side textarea{min-height:40px}.ask.side .hint{display:none}
     .ask.side .ta *{font-size:13.5px}.ask.side header b{font-size:12.5px}
@@ -1571,6 +1730,8 @@ TRACKER_JS = r"""
     .hp{position:fixed;left:14px;bottom:60px;width:min(380px,calc(100vw - 28px));max-height:72vh;display:flex;flex-direction:column;background:var(--bg);color:var(--fg);
       border:1px solid var(--ln);border-radius:12px;box-shadow:0 8px 28px #0004;overflow:hidden}
     .hp header{padding:10px 12px 8px;border-bottom:1px solid var(--ln)}.hp header b{font-size:14px}
+    .hp .hsc{float:right;display:inline-flex;border:1px solid var(--ln);border-radius:7px;overflow:hidden}.hp .hsc button{border:0;border-radius:0;padding:2px 9px;font-size:12px;color:var(--mu)}
+    .hp .hsc button.on{background:var(--ac);color:#fff}
     .hp input{width:100%;margin-top:8px;background:none;color:var(--fg);border:1px solid var(--ln);border-radius:8px;padding:7px 10px;font-size:13px}
     .hp .ls{overflow:auto;overscroll-behavior:contain}
     .hp .it{display:block;width:100%;text-align:left;border:0;border-bottom:1px solid var(--ln);border-radius:0;padding:8px 12px}
@@ -1666,9 +1827,9 @@ TRACKER_JS = r"""
   <div class="dock" hidden></div>
   <div class="work" hidden><b></b></div><button class="jump" hidden></button>
   <button class="hb" title="설명 카드 기록 — 지금까지 만든 카드 다시 열기">카드</button>
-  <div class="hp" hidden><header><b>설명 카드 기록</b> <span class="mu cnt"></span><input placeholder="용어·문서 검색"></header><div class="ls"></div></div>
+  <div class="hp" hidden><header><b>설명 카드 기록</b> <span class="mu cnt"></span><span class="hsc"><button data-h="doc" class="on">이 문서</button><button data-h="all">전체</button></span><input placeholder="용어·문서 검색"></header><div class="ls"></div></div>
   <div class="chip" hidden><button data-c="e" title="개념 카드 (e)">설명</button><button data-c="a" title="이 문서를 만든 세션에 질문·수정 요청 (a)">질문·수정</button></div>
-  <div class="ask" hidden><header><b>만든 세션에 묻기</b><small class="si"></small><button class="hb2" data-q="side" title="옆으로 작게 (본문 보면서)">옆으로 ▸</button><button class="hb2" data-q="flip" title="반대쪽으로" hidden>⇄</button><button class="hb2" data-q="float" title="고른 곳 옆에 크게" hidden>⤢</button><button class="x" data-q="x" title="닫기 (Esc) · 진행 중인 요청은 계속됨">×</button></header>
+  <div class="ask" hidden><header><b>만든 세션에 묻기</b><small class="si"></small><small class="ms"></small><button class="hb2" data-q="side" title="옆으로 작게 (본문 보면서)">옆으로 ▸</button><button class="hb2" data-q="flip" title="반대쪽으로" hidden>⇄</button><button class="hb2" data-q="float" title="고른 곳 옆에 크게" hidden>⤢</button><button class="hb2" data-q="mini" title="접기" hidden>–</button><button class="x" data-q="x" title="닫기 (Esc) · 돌고 있으면 접힘">×</button></header>
     <div class="qs"></div><div class="th"></div>
     <form><textarea rows="2"></textarea><div class="row2"><span class="seg"><button type="button" data-m="ask" class="on">질문</button><button type="button" data-m="edit">HTML 수정</button></span>
       <span class="hint">Enter 보내기 · Shift+Enter 줄바꿈</span><button class="p" type="submit">보내기</button></div></form></div>
@@ -1877,8 +2038,10 @@ TRACKER_JS = r"""
   const DK = 'wimdock', DMAX = 12, SS = [];
   const setTag = (S, t) => { S.tag = t; if (X === S) $('.card .tag').textContent = t; };
   const setBusy = (S, on, ph) => { S.busy = on; S.ph = ph || PH; if (X === S) { const i = $('.card input'); i.disabled = on; i.placeholder = S.ph; } };
-  const saveDock = () => { try { localStorage.setItem(DK, JSON.stringify(SS.slice(-DMAX).map(s => ({term: s.term, ctx: s.ctx, head: s.head, doc: s.doc,
-    k: s.k, title: s.title, st: s.st === 'run' ? 'run' : 'idle'})))); } catch {} };
+  // 하단 탭은 페이지마다 따로: 이 페이지에서 연 카드만 보인다(다른 페이지 것은 남겨 두고 덮어쓰지 않는다)
+  const saveDock = () => { try { const all = JSON.parse(localStorage.getItem(DK) || '[]').filter(x => (x.page || x.k) !== K);
+    localStorage.setItem(DK, JSON.stringify(all.concat(SS.slice(-DMAX).map(s => ({term: s.term, ctx: s.ctx, head: s.head, doc: s.doc,
+      k: s.k, page: K, title: s.title, st: s.st === 'run' ? 'run' : 'idle'}))).slice(-300))); } catch {} };
   const session = x => {
     const S = {term: x.term, ctx: x.ctx || '', head: x.head || '', doc: x.doc || '', k: x.k || K, title: x.title || document.title,
       last: '', st: 'idle', tag: '', busy: false, ph: PH, top: 0, t0: Date.now()};
@@ -2031,11 +2194,14 @@ TRACKER_JS = r"""
   // 왼쪽 아래 '카드' 버튼: 서버에 저장된 모든 카드 목록 → 고르면 저장본을 바로 연다(새로 만들지 않음)
   let hpT;
   const ago2 = t => { const d = new Date(t * 1000); return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`; };
-  const loadHist = () => fetch(API + 'explains?q=' + encodeURIComponent($('.hp input').value.trim())).then(r => r.json()).then(j => {
+  let HSC = 'doc';
+  $('.hp .hsc').addEventListener('click', e => { const h = e.target.closest('[data-h]')?.dataset.h; if (!h) return; HSC = h;
+    $('.hp .hsc').querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.h === h)); loadHist(); });
+  const loadHist = () => fetch(API + 'explains?q=' + encodeURIComponent($('.hp input').value.trim()) + (HSC === 'doc' ? '&k=' + encodeURIComponent(K) : '')).then(r => r.json()).then(j => {
     const it = j.items || []; $('.hp .cnt').textContent = it.length + '개';
     $('.hp .ls').innerHTML = it.length ? it.map(x => `<button class="it${x.key === K ? ' here' : ''}" data-id="${x.id}"><b>${esc(x.term)}</b>
       <small>${esc(x.title || x.key || '')} · ${ago2(x.created_at)}${/deep/.test(x.model || '') ? '' : ' · 간단 카드'}</small></button>`).join('')
-      : '<div class="mu" style="padding:14px">기록 없음</div>';
+      : `<div class="mu" style="padding:14px">${HSC === 'doc' ? '이 문서에서 만든 카드 없음 · 위 \'전체\'를 누르면 다른 문서 카드' : '기록 없음'}</div>`;
   }).catch(() => { $('.hp .ls').innerHTML = '<div class="mu" style="padding:14px">불러오기 실패</div>'; });
   const fromHist = id => fetch(API + 'explains?id=' + id).then(r => r.json()).then(x => {
     if (!x.term) return;
@@ -2064,16 +2230,20 @@ TRACKER_JS = r"""
   const sessLabel = si => !si ? '세션 찾는 중…' : si.error ? '이 컴퓨터에서만 쓸 수 있습니다' : si.sid
     ? `세션 ${si.sid.slice(0, 8)} · ${dstr(si.mtime)}${si.n ? ` · 이 폴더 ${si.n}번 수정` : ''}${si.fork ? ' · 이어서 묻는 중' : ''}` : '만든 세션을 못 찾음 → 새 세션으로 묻습니다';
   // 요청은 서버에서 따로 돈다. 연결이 끊기면 같은 id로 다시 붙는다(수정 요청이 두 번 돌지 않게 resume_only)
-  async function askStream(b, h) {
-    const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-    for (let n = 0; n < 40; n++) {
+  // id가 같으면 서버가 같은 작업에 다시 붙인다(새로고침·서버 재시작 뒤에도 기록에서 이어 받음). 45초 동안 아무것도 안 오면 끊긴 것으로 보고 다시 붙는다
+  async function askStream(b, h, id, reattach) {
+    id = id || Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    for (let n = 0; n < 60; n++) {
       let fin = false;
       try {
-        const r = await fetch(API + 'ask', {method: 'POST', body: JSON.stringify({k: K, ...b, id, resume_only: n > 0})});
+        const r = await fetch(API + 'ask', {method: 'POST', body: JSON.stringify({k: K, ...b, id, resume_only: reattach || n > 0})});
         if (!r.ok) { let m = '요청 거절'; try { m = (await r.json()).error || m; } catch {} h.err(m); return; }
         h.reset?.();
         const rd = r.body.getReader(), dec = new TextDecoder(); let buf = '';
-        for (;;) { const {done, value} = await rd.read(); if (done) break; buf += dec.decode(value, {stream: true});
+        for (;;) {
+          const res = await Promise.race([rd.read(), new Promise(ok => setTimeout(() => ok({stall: 1}), 45000))]);
+          if (res.stall) { try { rd.cancel(); } catch {} break; }
+          if (res.done) break; buf += dec.decode(res.value, {stream: true});
           for (let i; (i = buf.indexOf('\n')) >= 0;) { const ln = buf.slice(0, i); buf = buf.slice(i + 1); let ev; try { ev = JSON.parse(ln); } catch { continue; }
             if (ev.e === 'done') { fin = true; h.done(ev); } else if (ev.e === 'err') { fin = true; h.err(ev.msg); } else h[ev.e]?.(ev); } }
       } catch {}
@@ -2082,63 +2252,106 @@ TRACKER_JS = r"""
     }
     h.err('서버와 연결이 계속 끊깁니다');
   }
-  let AQ = null, AM = 'ask', abusy = false, ASIDE = false, BASE = null, WORK = null, LASTCHG = [];
+
+  // 고른 곳마다 따로 창(스레드)을 띄운다. 창마다 자기 세션 갈래를 가져 여러 개가 동시에 돈다(같은 덩어리 수정은 서버가 줄 세움)
+  const TPL = $('.ask'), WTPL = $('.work'), PANES = [];
   let SIDE = 'right'; try { SIDE = localStorage.getItem('wimaskside') || 'right'; } catch {}
+  let FOCUS = null, BASE = null, LIVE = Promise.resolve(), LASTCHG = [];
   const AP = {ask: '예: 그럼 지금 하드웨어는 USB로 연결된 건가? USB 대기는 뭐지?', edit: '예: 이 그림 아래에 USB 대기가 무엇인지 한 문단 추가해줘'};
-  const setMode = m => { AM = m; const a = $('.ask'); a.classList.toggle('edit', m === 'edit');
-    a.querySelectorAll('[data-m]').forEach(b => b.classList.toggle('on', b.dataset.m === m)); a.querySelector('textarea').placeholder = AP[m]; };
-  const rangeRect = () => { try { if (AQ?.range) { const b = AQ.range.getBoundingClientRect(); if (b.width || b.height) return toTop(b, AQ.doc); } } catch {} return null; };
-  // 고친 곳·묻는 곳 표시: 고른 덩어리(그림·문단)를 점선 테두리로 감싸고 '고치는 중' 딱지를 단다
-  const placeWork = () => { const w = $('.work');
-    if (!WORK) { w.hidden = true; return; }
-    let r = null; try { if (WORK.el?.isConnected) r = toTop(WORK.el.getBoundingClientRect(), AQ?.doc || document); } catch {}
-    r = r || rangeRect(); if (!r) { w.hidden = true; return; }
+  const blkOf = range => { const n0 = range?.startContainer, e0 = n0 && (n0.nodeType === 1 ? n0 : n0.parentElement);
+    let b = e0?.closest?.('figure') || e0?.closest?.('svg') || e0?.closest?.(BLK) || e0; while (b?.ownerSVGElement) b = b.ownerSVGElement; return b || null; };
+  const norm = t => (t || '').replace(/\s+/g, ' ').trim();
+  const sigOf = el => el ? el.tagName + ':' + norm(el.textContent).slice(0, 80) : '';
+  const findBySig = sig => { if (!sig) return null; const i = sig.indexOf(':'), tag = sig.slice(0, i), t = sig.slice(i + 1); if (!t) return null;
+    for (const d of allDocs()) for (const el of d.querySelectorAll(tag)) if (norm(el.textContent).startsWith(t)) return {el, doc: d}; return null; };
+  const skin = el => { for (const [k, v] of Object.entries(KT)) if (k !== 'dark') el.style.setProperty('--k-' + k, v);
+    const f = $('.card').style.getPropertyValue('--k-font'); if (f) el.style.setProperty('--k-font', f); };
+  const rectOf = P => { try { const el = (P.work?.el?.isConnected && P.work.el) || (P.blk?.isConnected && P.blk);
+      if (el) return toTop(el.getBoundingClientRect(), P.doc);
+      if (P.range) { const b = P.range.getBoundingClientRect(); if (b.width || b.height) return toTop(b, P.doc); } } catch {} return null; };
+  const setMode = (P, m) => { P.mode = m; P.el.classList.toggle('edit', m === 'edit');
+    P.el.querySelectorAll('[data-m]').forEach(b => b.classList.toggle('on', b.dataset.m === m)); P.el.querySelector('textarea').placeholder = AP[m]; };
+  const updMini = P => { P.el.querySelector('.ms').textContent = P.status || norm(P.sel).slice(0, 40); };
+  const placeWork = P => { const w = P.wk;
+    if (!P.work) { w.hidden = true; return; }
+    const r = rectOf(P); if (!r) { w.hidden = true; return; }
     const top = Math.max(-20, r.top - 6), bot = Math.min(innerHeight + 20, r.bottom + 6);
     if (bot < 0 || top > innerHeight) { w.hidden = true; return; }
-    w.hidden = false; w.querySelector('b').textContent = WORK.label;
+    w.hidden = false; w.querySelector('b').textContent = P.work.label;
     Object.assign(w.style, {left: (r.left - 6) + 'px', top: top + 'px', width: (r.right - r.left + 12) + 'px', height: (bot - top) + 'px'}); };
-  const blkRect = () => { const el = (WORK?.el?.isConnected && WORK.el) || (AQ?.blk?.isConnected && AQ.blk);
-    try { if (el) return toTop(el.getBoundingClientRect(), AQ?.doc || document); } catch {} return rangeRect(); };
-  // 입력창은 화면이 아니라 본문에 붙는다: 보내기 전엔 고른 곳 아래(또는 위), 보낸 뒤엔 고치는 덩어리 옆. 스크롤하면 그 절과 같이 지나간다
-  const placeAsk = () => { const a = $('.ask'); placeWork(); if (a.hidden) return;
-    a.classList.toggle('side', ASIDE); a.style.width = ''; a.style.right = 'auto'; a.style.bottom = 'auto';
-    a.querySelector('[data-q="side"]').hidden = ASIDE; a.querySelector('[data-q="flip"]').hidden = !ASIDE; a.querySelector('[data-q="float"]').hidden = !ASIDE || !rangeRect();
-    if (ASIDE) {
-      a.style.maxHeight = Math.min(innerHeight - 140, 560) + 'px';
-      const r = blkRect();
-      if (!r) { Object.assign(a.style, SIDE === 'left' ? {left: '14px', right: 'auto'} : {left: 'auto', right: '14px'}, {top: 'auto', bottom: '58px'}); return; }
-      // 덩어리 오른쪽(또는 왼쪽) 빈칸에 붙인다. 빈칸이 300px 안 되면 화면 가장자리에 붙이되 높이는 그 덩어리 위쪽에 맞춘다
-      const gapR = innerWidth - r.right - 28, gapL = r.left - 28, pref = SIDE === 'left' ? [gapL, gapR] : [gapR, gapL];
-      let x;
-      if (pref[0] >= 300 || pref[1] >= 300) { const left = (SIDE === 'left' ? gapL >= 300 : !(gapR >= 300)); const g = left ? gapL : gapR, w = Math.min(380, g);
-        a.style.width = w + 'px'; x = left ? r.left - w - 14 : r.right + 14; }
+  // 창 배치: 보내기 전 창은 고른 곳 위·아래, 보낸 창은 그 덩어리 옆. 옆 창이 여럿이면 위에서부터 줄 세우고 겹치면 아래로 민다.
+  // 화면이 아니라 본문 좌표라 스크롤하면 그 절과 같이 지나간다. 지금 보는 창(FOCUS) 하나만 펼치고 나머지는 한 줄로 접는다
+  function layout() {
+    const side = [];
+    for (const P of PANES) { const a = P.el; placeWork(P);
+      P.mini = P.side && P !== FOCUS;
+      a.classList.toggle('side', P.side); a.classList.toggle('mini', P.mini); a.classList.toggle('focus', P === FOCUS);
+      a.style.width = ''; a.style.right = 'auto'; a.style.bottom = 'auto';
+      a.querySelector('[data-q="side"]').hidden = P.side; a.querySelector('[data-q="flip"]').hidden = !P.side || P.mini;
+      a.querySelector('[data-q="float"]').hidden = !P.side || P.mini || !rectOf(P); a.querySelector('[data-q="mini"]').hidden = !P.side || P.mini;
+      updMini(P);
+      if (P.side) { side.push(P); continue; }
+      const w = a.offsetWidth, r = rectOf(P); let x, y;
+      if (!r) { a.style.maxHeight = ''; x = (innerWidth - w) / 2; y = innerHeight - a.offsetHeight - 56; }
+      else { x = Math.min(innerWidth - w - 12, Math.max(12, r.left));
+        const below = innerHeight - r.bottom - 60, above = r.top - 20, down = below >= above, room = Math.max(260, (down ? below : above));
+        a.style.maxHeight = Math.min(room, innerHeight * 0.72, 680) + 'px'; const h2 = a.offsetHeight;
+        y = down ? r.bottom + 10 : r.top - h2 - 10; }
+      a.style.left = Math.max(12, x) + 'px'; a.style.top = y + 'px'; }
+    const items = side.map(P => ({P, r: rectOf(P)})), anch = items.filter(o => o.r).sort((a, b) => a.r.top - b.r.top || PANES.indexOf(a.P) - PANES.indexOf(b.P));
+    let bottom = -1e9;
+    for (const {P, r} of anch) { const a = P.el; a.style.maxHeight = P.mini ? '' : Math.min(innerHeight - 140, 560) + 'px';
+      const gapR = innerWidth - r.right - 28, gapL = r.left - 28;
+      const useL = SIDE === 'left' ? gapL >= 300 : (gapR < 300 && gapL >= 300), useR = !useL && gapR >= 300;
+      let x; if (useL) { const w = Math.min(380, gapL); a.style.width = w + 'px'; x = r.left - w - 14; }
+      else if (useR) { const w = Math.min(380, gapR); a.style.width = w + 'px'; x = r.right + 14; }
       else x = SIDE === 'left' ? 14 : innerWidth - Math.min(380, innerWidth - 24) - 14;
-      a.style.left = x + 'px'; a.style.top = r.top + 'px'; return;
-    }
-    const w = a.offsetWidth, r = rangeRect(); let x, y;
-    if (!r) { a.style.maxHeight = ''; x = (innerWidth - w) / 2; y = innerHeight - a.offsetHeight - 56; }
-    else { x = Math.min(innerWidth - w - 12, Math.max(12, r.left));
-      // 고른 곳을 가리지 않게 위·아래 중 넓은 쪽에 두고 그 칸에 맞춰 높이를 줄인다(최소 260px). 화면 밖으로 따라오지는 않는다
-      const below = innerHeight - r.bottom - 60, above = r.top - 20, down = below >= above, room = Math.max(260, (down ? below : above));
-      a.style.maxHeight = Math.min(room, innerHeight * 0.72, 680) + 'px'; const h2 = a.offsetHeight;
-      y = down ? r.bottom + 10 : r.top - h2 - 10; }
-    a.style.left = Math.max(12, x) + 'px'; a.style.top = y + 'px'; };
-  const glide = () => { const a = $('.ask'); a.classList.add('mv'); setTimeout(() => a.classList.remove('mv'), 360); placeAsk(); };
-  const saveAsk = open => { try { sessionStorage.setItem('wimask:' + K, JSON.stringify({th: $('.ask .th').innerHTML, sel: AQ?.sel, ctx: AQ?.ctx, head: AQ?.head, mode: AM, open})); } catch {} };
+      const y = Math.max(r.top, bottom + 8); a.style.left = x + 'px'; a.style.top = y + 'px'; bottom = y + a.offsetHeight; }
+    let yb = 58;
+    for (const {P} of items.filter(o => !o.r)) { const a = P.el; a.style.maxHeight = P.mini ? '' : Math.min(innerHeight - 140, 560) + 'px';
+      Object.assign(a.style, SIDE === 'left' ? {left: '14px', right: 'auto'} : {left: 'auto', right: '14px'}, {top: 'auto', bottom: yb + 'px'}); yb += a.offsetHeight + 8; }
+  }
+  const glide = P => { P.el.classList.add('mv'); setTimeout(() => P.el.classList.remove('mv'), 360); layout(); };
+  const savePanes = () => { try { sessionStorage.setItem('wimpanes:' + K, JSON.stringify(PANES.filter(P => P.el.querySelector('.th').children.length).map(P =>
+    ({th: P.el.querySelector('.th').innerHTML, sel: P.sel, ctx: P.ctx, head: P.head, mode: P.mode, thread: P.thread, sig: P.sig})))); } catch {} };
+  const dropPane = P => { P.el.remove(); P.wk.remove(); PANES.splice(PANES.indexOf(P), 1); if (FOCUS === P) FOCUS = null; savePanes(); layout(); };
+  function newPane(x) {
+    const el = TPL.cloneNode(true), wk = WTPL.cloneNode(true); el.hidden = false; wk.hidden = true; R.append(el); R.append(wk);
+    const P = {el, wk, range: x.range || null, doc: x.doc || document, sel: x.sel || '', ctx: x.ctx || '', head: x.head || '', blk: x.blk || null,
+      sig: x.sig || sigOf(x.blk), mode: x.mode || 'ask', side: !!x.side, busy: 0, thread: x.thread || '', work: null, status: ''};
+    PANES.push(P); theme(); skin(el);
+    el.querySelector('.qs').innerHTML = '<b>고른 부분</b>' + esc(P.sel.length > 600 ? P.sel.slice(0, 600) + '…' : P.sel);
+    if (x.th) { el.querySelector('.th').innerHTML = x.th; el.querySelectorAll('.live .sp').forEach(n => n.remove()); }
+    el.querySelector('.si').textContent = sessLabel(SIC[K]); sessOf(K).then(si => el.querySelector('.si').textContent = sessLabel(si));
+    setMode(P, P.mode);
+    el.querySelector('form').addEventListener('submit', e => { e.preventDefault(); sendAsk(P); });
+    el.addEventListener('keydown', e => { e.stopPropagation();
+      if (e.key === 'Escape') { if (P.busy || el.querySelector('.th').children.length) { P.side = true; FOCUS = null; layout(); } else dropPane(P); }
+      else if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.target.tagName === 'TEXTAREA') { e.preventDefault(); sendAsk(P); } });
+    el.addEventListener('click', e => { const q = e.target.closest('[data-q]')?.dataset.q, m = e.target.closest('[data-m]')?.dataset.m;
+      if (m) return setMode(P, m);
+      if (q === 'x') return (P.busy ? (P.side = true, FOCUS = null, layout()) : dropPane(P));
+      if (q === 'mini') { FOCUS = null; return layout(); }
+      if (q === 'side') { P.side = true; return glide(P); }
+      if (q === 'float') { P.side = false; FOCUS = P; return glide(P); }
+      if (q === 'flip') { SIDE = SIDE === 'left' ? 'right' : 'left'; try { localStorage.setItem('wimaskside', SIDE); } catch {} return glide(P); }
+      if (q === 'jump') return jumpChg();
+      if (q === 'reload') { try { sessionStorage.setItem('wimgo', JSON.stringify({a: anchor(), r: ratio()})); } catch {} savePanes(); return location.reload(); }
+      if (FOCUS !== P) { FOCUS = P; layout(); } });
+    return P;
+  }
   const openAsk = p => {
     if (!p) return; $('.chip').hidden = true;
-    const n0 = p.range?.startContainer, e0 = n0 && (n0.nodeType === 1 ? n0 : n0.parentElement);
-    let blk = e0?.closest?.('figure') || e0?.closest?.('svg') || e0?.closest?.(BLK) || e0; while (blk?.ownerSVGElement) blk = blk.ownerSVGElement;
-    AQ = {range: p.range || null, doc: p.odoc || document, sel: p.term, ctx: p.ctx, head: p.head, blk};
+    const blk = blkOf(p.range);
     try { p.odoc?.getSelection().removeAllRanges(); getSelection().removeAllRanges(); R.getSelection?.()?.removeAllRanges(); } catch {}
-    theme(); const a = $('.ask'); a.hidden = false; ASIDE = false;
-    a.querySelector('.qs').innerHTML = '<b>고른 부분</b>' + esc(p.term.length > 600 ? p.term.slice(0, 600) + '…' : p.term);
-    a.querySelector('.si').textContent = sessLabel(SIC[K]);
-    sessOf(K).then(si => a.querySelector('.si').textContent = sessLabel(si));
-    setMode(AM); glide(); a.querySelector('textarea').focus();
+    // 아직 아무것도 안 보낸 빈 창이 있으면 그 창을 새 자리로 옮기고, 없으면 새 창을 연다(돌고 있는 창은 그 자리에 남는다)
+    let P = PANES.find(x => !x.busy && !x.el.querySelector('.th').children.length);
+    if (P) { Object.assign(P, {range: p.range || null, doc: p.odoc || document, sel: p.term, ctx: p.ctx, head: p.head, blk, sig: sigOf(blk), side: false});
+      P.el.querySelector('.qs').innerHTML = '<b>고른 부분</b>' + esc(p.term.length > 600 ? p.term.slice(0, 600) + '…' : p.term); }
+    else P = newPane({range: p.range, doc: p.odoc, sel: p.term, ctx: p.ctx, head: p.head, blk, mode: PANES.at(-1)?.mode});
+    FOCUS = P; glide(P); P.el.querySelector('textarea').focus();
   };
-  const closeAsk = () => { $('.ask').hidden = true; saveAsk(false); };
-  // ---- 화면에 바로 반영: 고친 파일을 다시 받아 이전 파일과 비교하고, 바뀐 가장 작은 덩어리만 화면 DOM에서 바꾼다 ----
+  // ---- 화면에 바로 반영: 고친 파일을 다시 받아 이전 파일과 비교하고, 바뀐 가장 작은 덩어리만 화면 DOM에서 바꾼다(창이 여럿이어도 한 줄로) ----
   const loadFile = () => fetch(location.href.split('#')[0], {cache: 'no-store'}).then(r => r.text()).then(t => new DOMParser().parseFromString(t, 'text/html'));
   const kidsOf = el => [...el.childNodes].filter(n => n.nodeType === 1 ? !(n.id === '__wim_reader' || /^(SCRIPT|NOSCRIPT)$/.test(n.tagName)) : n.nodeType === 3 && n.data.trim());
   const sameN = (x, y) => x.nodeType === 3 ? x.data === y.data : x.outerHTML === y.outerHTML;
@@ -2186,69 +2399,68 @@ TRACKER_JS = r"""
         op.add.forEach(y => { const z = document.importNode(y, true); t.insertBefore(z, before); marks.push(z.nodeType === 1 ? z : t); });
         if (!op.add.length) marks.push(t); } }
     BASE = nd; const shown = flash(marks); showJump(shown);
-    if (WORK && !WORK.el?.isConnected) WORK.el = shown[0]; if (AQ && !AQ.blk?.isConnected) AQ.blk = shown[0]; placeAsk();
-    return shown.length;
+    for (const P of PANES) if (P.blk && !P.blk.isConnected) { const f = findBySig(P.sig); P.blk = f?.el || shown[0] || null; if (P.work) P.work.el = P.blk; }
+    layout(); return shown.length;
   }
-  const sendAsk = async () => {
-    const a = $('.ask'), t = a.querySelector('textarea'), q = t.value.trim(); if (!q || abusy) return;
-    abusy = true; t.value = ''; const mode = AM, btn = a.querySelector('button.p'); btn.disabled = true; btn.textContent = '처리 중…';
-    ASIDE = true; WORK = {label: mode === 'edit' ? '만든 세션이 고치는 중…' : '만든 세션이 읽는 중…', el: AQ?.blk || null}; glide();
+  async function sendAsk(P) {
+    const a = P.el, t = a.querySelector('textarea'), q = t.value.trim(); if (!q) return;
+    t.value = ''; const mode = P.mode, id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
     if (mode === 'edit' && !BASE) { try { BASE = await loadFile(); } catch {} }
-    const th = a.querySelector('.th'), item = document.createElement('div');
+    const item = document.createElement('div'); Object.assign(item.dataset, {jid: id, mode, q, run: '1'});
     item.innerHTML = `<div class="tq"><i class="${mode === 'edit' ? 'ed' : ''}">${mode === 'edit' ? 'HTML 수정' : '질문'}</i>${esc(q)}</div>`
       + '<div class="tl live"><span class="sp"></span><span class="st">보냄 · 세션 여는 중</span><span class="tm">0초</span></div><div class="tls"></div><div class="ta cur"></div>';
-    th.append(item); th.scrollTop = th.scrollHeight; placeAsk();
+    a.querySelector('.th').append(item); savePanes();
+    runItem(P, item, {sel: P.sel, ctx: P.ctx, head: P.head, q, mode, thread: P.thread, blk: P.sig}, false);
+  }
+  async function runItem(P, item, req, reattach) {
+    const a = P.el, th = a.querySelector('.th'), mode = item.dataset.mode, id = item.dataset.jid;
+    P.busy++; P.side = true; if (!reattach) FOCUS = P;
+    P.work = {label: mode === 'edit' ? '만든 세션이 고치는 중…' : '만든 세션이 읽는 중…', el: P.blk}; glide(P);
+    if (reattach) { item.querySelector('.ok')?.remove(); const lv = item.querySelector('.live'); lv.classList.remove('end');
+      if (!lv.querySelector('.sp')) lv.insertAdjacentHTML('afterbegin', '<span class="sp"></span>'); item.querySelector('.ta').classList.add('cur'); }
+    th.scrollTop = th.scrollHeight;
     const tls = item.querySelector('.tls'), ta = item.querySelector('.ta'), st = item.querySelector('.st'), tm = item.querySelector('.tm'), t0 = Date.now();
-    const tick = setInterval(() => tm.textContent = Math.round((Date.now() - t0) / 1000) + '초', 1000);
-    let txt = '', nchg = 0, stale = false, chain = Promise.resolve();
-    const stage = m => { st.textContent = m; };
+    const stage = m => { st.textContent = m; P.status = `${mode === 'edit' ? '수정' : '질문'} · ${m} · ${Math.round((Date.now() - t0) / 1000)}초`; updMini(P); };
+    const tick = setInterval(() => { tm.textContent = Math.round((Date.now() - t0) / 1000) + '초'; stage(st.textContent); }, 1000);
+    let txt = '', nchg = 0, stale = false, fin = null;
     const line = m => { tls.insertAdjacentHTML('beforeend', `<div class="tl">${esc(m)}</div>`); th.scrollTop = th.scrollHeight; };
-    const apply = () => chain = chain.then(async () => { stage('화면에 반영 중'); const n = await liveApply();
+    const apply = () => LIVE = LIVE.then(async () => { stage('화면에 반영 중'); const n = await liveApply();
       if (n > 0) { nchg += n; line(`화면에 반영 · ${n}곳`); } else if (n < 0) stale = true; });
-    let fin = null;
-    await askStream({sel: AQ?.sel || '', ctx: AQ?.ctx || '', head: AQ?.head || '', q, mode}, {
+    if (reattach) stage('다시 붙는 중');
+    await askStream(req, {
       reset: () => { txt = ''; tls.innerHTML = ''; ta.innerHTML = ''; },
-      meta: ev => { stage(ev.how === 'cont' ? '같은 대화에 이어서 묻는 중' : ev.how === 'fork' ? '만든 세션 맥락 불러오는 중' : '새 세션 여는 중');
-        if (ev.how === 'fork') line(`만든 세션 ${String(ev.sid).slice(0, 8)}을 이어받음`); else if (ev.how === 'new') line('만든 세션을 못 찾아 새 세션으로'); },
+      thread: ev => { P.thread = ev.sid; savePanes(); },
+      queue: ev => stage(`대기 · 같은 덩어리 수정 ${ev.n}개 먼저`),
+      hb: () => {},
+      meta: ev => { stage(ev.how === 'cont' ? '같은 창 대화에 이어서' : ev.how === 'fork' ? '만든 세션 맥락 불러오는 중' : '새 세션 여는 중');
+        if (ev.how === 'fork') line(`만든 세션 ${String(ev.sid).slice(0, 8)}에서 이 창 전용 갈래를 냄`); else if (ev.how === 'new') line('만든 세션을 못 찾아 새 세션으로'); },
       tool: ev => { stage(`${TOOLK[ev.name] || ev.name} 중`); line(`${TOOLK[ev.name] || ev.name} · ${ev.arg || ''}`); },
       file: () => apply(),
       note: ev => line(ev.msg),
-      text: ev => { stage(mode === 'edit' ? '고치며 설명 쓰는 중' : '답 쓰는 중'); txt += ev.d; ta.innerHTML = md(txt); th.scrollTop = th.scrollHeight; },
-      done: ev => { fin = ev; },
-      err: m => { fin = {err: m}; }
-    });
+      text: ev => { stage(mode === 'edit' ? '고치며 설명 쓰는 중' : '답 쓰는 중'); txt += ev.d; ta.innerHTML = md(txt); if (FOCUS === P) th.scrollTop = th.scrollHeight; },
+      done: ev => { fin = ev; }, err: m => { fin = {err: m}; } }, id, reattach);
     if (fin?.changed) apply();  // 마지막 빌드가 감시 틈에 걸렸을 수 있다
-    await chain; clearInterval(tick); ta.classList.remove('cur');
-    const live = item.querySelector('.live'); live.classList.add('end'); live.querySelector('.sp').remove();
+    await LIVE; clearInterval(tick); ta.classList.remove('cur'); item.dataset.run = '0';
+    const live = item.querySelector('.live'); live.classList.add('end'); live.querySelector('.sp')?.remove();
     if (fin?.err && !fin.sec) { stage('실패'); ta.innerHTML = md(txt) + `<p style="color:var(--k-warn)">[실패] ${esc(fin.err)}</p>`; }
     else { stage(fin?.changed ? (nchg ? '끝 · 화면에 반영됨' : '끝 · 파일 고침') : mode === 'edit' ? '끝 · 파일 변화 없음' : '끝');
       if (!txt) ta.innerHTML = '';
       if (fin?.changed) item.insertAdjacentHTML('beforeend', nchg && !stale
         ? `<div class="ok">화면에 바로 반영했습니다 · ${nchg}곳<button type="button" data-q="jump">바뀐 곳 보기</button><button type="button" class="lnk" data-q="reload">새로고침</button></div>`
-        : `<div class="ok">HTML이 고쳐졌습니다 · 이 페이지는 스크립트로 그려져 새로고침이 필요합니다<button type="button" data-q="reload">새로고침해서 보기</button></div>`); }
-    WORK = null; placeWork();
-    abusy = false; btn.disabled = false; btn.textContent = '보내기'; saveAsk(!a.hidden); placeAsk(); th.scrollTop = th.scrollHeight;
-    delete SIC[K]; sessOf(K).then(si => a.querySelector('.si').textContent = sessLabel(si));
-  };
-  $('.ask form').addEventListener('submit', e => { e.preventDefault(); sendAsk(); });
-  $('.ask').addEventListener('keydown', e => { e.stopPropagation();
-    if (e.key === 'Escape') closeAsk();
-    else if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.target.tagName === 'TEXTAREA') { e.preventDefault(); sendAsk(); } });
-  $('.ask').addEventListener('click', e => { const q = e.target.closest('[data-q]')?.dataset.q, m = e.target.closest('[data-m]')?.dataset.m;
-    if (m) setMode(m);
-    else if (q === 'x') closeAsk();
-    else if (q === 'side') { ASIDE = true; glide(); }
-    else if (q === 'float') { ASIDE = false; glide(); }
-    else if (q === 'flip') { SIDE = SIDE === 'left' ? 'right' : 'left'; try { localStorage.setItem('wimaskside', SIDE); } catch {} glide(); }
-    else if (q === 'jump') jumpChg();
-    else if (q === 'reload') { try { sessionStorage.setItem('wimgo', JSON.stringify({a: anchor(), r: ratio()})); } catch {} saveAsk(true); location.reload(); } });
+        : `<div class="ok">HTML이 고쳐졌습니다 · 새로고침해야 보입니다<button type="button" data-q="reload">새로고침해서 보기</button></div>`); }
+    P.busy--; if (!P.busy) P.work = null;
+    if (FOCUS !== P && PANES.includes(P)) toast(`‘${esc(norm(P.sel).slice(0, 20))}’ ${mode === 'edit' ? '수정' : '답'} 끝`, 6000, [['보기', () => { FOCUS = P; layout(); }]]);
+    savePanes(); layout(); th.scrollTop = th.scrollHeight;
+    delete SIC[K]; sessOf(K).then(si => a.querySelectorAll('.si').forEach(x => x.textContent = sessLabel(si)));
+  }
   $('.jump').addEventListener('click', jumpChg);
-  let pRaf = 0; const rePlace = () => { if (!pRaf) pRaf = requestAnimationFrame(() => { pRaf = 0; placeAsk(); }); };
+  let pRaf = 0; const rePlace = () => { if (!pRaf) pRaf = requestAnimationFrame(() => { pRaf = 0; layout(); }); };
   addEventListener('scroll', rePlace, {passive: true, capture: true}); addEventListener('resize', rePlace);
-  const restoreAsk = () => { try { const v = JSON.parse(sessionStorage.getItem('wimask:' + K) || 'null'); if (!v?.open) return;
-    AQ = {range: null, doc: document, sel: v.sel, ctx: v.ctx, head: v.head}; theme(); const a = $('.ask'); a.hidden = false; ASIDE = true;
-    a.querySelector('.qs').innerHTML = '<b>고른 부분</b>' + esc(v.sel || ''); a.querySelector('.th').innerHTML = v.th || ''; a.querySelector('.ok button')?.remove();
-    setMode(v.mode || 'ask'); sessOf(K).then(si => a.querySelector('.si').textContent = sessLabel(si)); placeAsk(); a.querySelector('.th').scrollTop = 1e9; } catch {} };
+  const restoreAsk = () => { try { const L = JSON.parse(sessionStorage.getItem('wimpanes:' + K) || '[]');
+    for (const v of L) { const f = findBySig(v.sig); const P = newPane({...v, blk: f?.el || null, doc: f?.doc || document, side: true});
+      // 새로고침 전에 돌던 요청: 같은 작업 id로 다시 붙어 이어 받는다(서버가 재시작됐어도 기록에서)
+      P.el.querySelectorAll('.th > div[data-run="1"]').forEach(it => runItem(P, it, {sel: P.sel, ctx: P.ctx, head: P.head, q: it.dataset.q, mode: it.dataset.mode, thread: P.thread, blk: P.sig}, true)); }
+    FOCUS = PANES.at(-1) || null; layout(); } catch {} };
   // 개념 카드의 '더 물어보기'도 만든 세션이 있으면 그 세션에 묻는다
   async function askCard(S, q) {
     setBusy(S, true, '만든 세션이 답하는 중…'); setTag(S, '만든 세션에 묻는 중');
@@ -2263,7 +2475,7 @@ TRACKER_JS = r"""
       done: () => {}, err: m => { txt += `\n\n[실패] ${m}`; box.innerHTML = md(txt); } });
     box.className = ''; S.last = (S.last ? S.last + '\n' : '') + txt; setTag(S, ''); setBusy(S, false);
   }
-  try { JSON.parse(localStorage.getItem(DK) || '[]').forEach(x => { const S = session(x); SS.push(S); if (x.st === 'run') run(S); }); } catch {}
+  try { JSON.parse(localStorage.getItem(DK) || '[]').filter(x => (x.page || x.k) === K).forEach(x => { const S = session(x); SS.push(S); if (x.st === 'run') run(S); }); } catch {}
   paintDock();
   $('.chip').addEventListener('mousedown', e => e.preventDefault());  // 선택이 풀리지 않게
   $('.chip').addEventListener('click', e => { const c = e.target.closest('[data-c]')?.dataset.c, p = pick || anyPick(); if (c === 'a') openAsk(p); else if (c) explain(p); });

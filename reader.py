@@ -1033,6 +1033,7 @@ def session_run(extra, prompt, cwd, on_text, on_tool=None, timeout=900, on_init=
     """claude -p를 cwd에서 돌린다(이어받기 인자는 extra). (새 세션 id, 답, 오류)를 돌려준다.
     log를 주면 출력을 그 파일에 쓰고 claude를 따로 된 프로세스 그룹으로 띄운다: 리더 서버가 재시작돼도 claude는 계속 돌고 서버가 파일을 다시 이어 읽는다."""
     env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDECODE", "CLAUDE_CODE_"))}
+    env["CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"] = "0"  # 백그라운드 에이전트를 10분 만에 끊지 않고 끝까지 기다린다(전체 시간 제한은 아래 timer)
     cmd = [CLAUDE, "-p", "--model", DEEP_MODEL, "--output-format", "stream-json", "--verbose", "--include-partial-messages", *extra, prompt]
     if log:
         log.parent.mkdir(parents=True, exist_ok=True)
@@ -1044,10 +1045,13 @@ def session_run(extra, prompt, cwd, on_text, on_tool=None, timeout=900, on_init=
     else:
         proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         lines = proc.stdout
-    timer = threading.Timer(timeout, lambda: _killpg(proc.pid) if log else proc.kill()); timer.start()
+    late = []
+    timer = threading.Timer(timeout, lambda: (late.append(1), _killpg(proc.pid) if log else proc.kill())); timer.start()
     try:
         sid, out, err = _parse_stream(lines, on_text, on_tool, on_init)
         proc.wait()
+        if late:
+            err = f"시간 제한 {timeout // 60}분을 넘겨 멈췄습니다. 같은 창에 '이어서 마무리'를 보내면 이 대화에서 이어 갑니다"
         if err in ("", "오류") and log and not out:  # 결과 줄에 이유가 없으면 claude가 stderr에 남긴 이유를 쓴다
             err = Path(str(log) + ".err").read_text(errors="ignore").strip()[-300:] or err
         if not out and not err and proc.returncode:
@@ -1064,12 +1068,14 @@ ASK_RULE = {
     "ask": "규칙: 이 문서를 만든 맥락과 근거 자료(_raw·출처·실측값·메일·회의)를 바탕으로 한국어로 충분히 자세히 답한다. 짧게 줄이지 않는다. "
            "먼저 결론을 한두 문장으로 말하고, 이어서 원리·구조(무엇이 무엇에 어떻게 연결되는지, 시간 순서), 이 문서의 숫자와 그 출처, "
            "헷갈리기 쉬운 점, 다음에 확인할 것을 절(## 제목)로 나눠 쓴다. 구조나 흐름은 ```mermaid 그림으로 보여 주고, 비교는 표로 쓴다. "
-           "필요하면 파일을 읽고 웹을 찾아 확인한다. 어떤 파일도 고치지 않는다. 확인 안 된 것은 ★로 표시한다.",
+           "필요하면 파일을 읽고 웹을 찾아 확인한다. 어떤 파일도 고치지 않는다. 확인 안 된 것은 ★로 표시한다. "
+           "에이전트(Agent)를 쓸 때는 run_in_background를 쓰지 말고 결과를 받은 뒤 다음으로 간다. '기다리겠다'며 턴을 끝내지 않는다: 턴이 끝나면 작업도 끝난다. ",
     "edit": "규칙: 이 HTML을 사용자 요청대로 고친다. 빌드 원본(_build/pages 조각 등)이 있으면 원본을 고치고 그 폴더의 원래 빌드 명령으로 다시 만든다. "
             "출력 _local.html만 손으로 고치지 않는다. 다른 문서·폴더는 건드리지 않는다. 사용자가 브라우저에서 바뀌는 모습을 지켜보고 있으니, "
             "고칠 곳이 여러 군데면 한 군데 고칠 때마다 빌드해서 바로 보이게 한다. 내용은 이 문서를 만들 때와 같은 수준으로 충실하게 쓴다: "
             "근거 자료를 다시 읽고, 필요하면 웹을 찾아 숫자와 출처를 붙이고, 이 문서의 그림·표 양식을 그대로 따른다. 한 줄 땜질로 끝내지 않는다. "
-            "끝나면 무엇을 어디에 왜 바꿨는지 한국어로 정리해 답한다.",
+            "끝나면 무엇을 어디에 왜 바꿨는지 한국어로 정리해 답한다. "
+            "에이전트(Agent)를 쓸 때는 run_in_background를 쓰지 말고 결과를 받은 뒤 다음으로 간다. '기다리겠다'며 턴을 끝내지 않는다: 턴이 끝나면 작업도 끝난다. ""원본을 고쳤으면 턴을 끝내기 전에 반드시 빌드까지 마친다.",
 }
 
 
@@ -1086,6 +1092,20 @@ def _job_meta(jid, upd):
         cur = {}
     cur.update(upd)
     f.write_text(json.dumps(cur, ensure_ascii=False))
+
+
+def _src_changed(p, t0):
+    """출력 HTML은 그대로인데 같은 폴더의 원본(_build·pages 등)만 바뀌었는지: 빌드 전에 끊긴 수정."""
+    if not p:
+        return []
+    out = []
+    for f in p.parent.rglob("*"):
+        try:
+            if f.is_file() and f != p and f.stat().st_mtime > t0 and "/.git/" not in str(f):
+                out.append(str(f.relative_to(p.parent)))
+        except OSError:
+            pass
+    return sorted(out)[:12]
 
 
 def _ask_resume(jid, push):
@@ -1115,6 +1135,8 @@ def _ask_resume(jid, push):
     stop.set()
     changed = bool(p and p.exists() and p.stat().st_mtime != m.get("mt0"))
     fin = {"e": "err", "msg": err or "작업이 중간에 끊겼습니다"} if not out else {"e": "done", "changed": changed, "sec": round(time.time() - m.get("t0", time.time())), "how": m.get("how"), "err": err}
+    if m.get("mode") == "edit" and not changed:
+        fin["src"] = _src_changed(p, m.get("t0", time.time()))
     _job_meta(jid, {"final": fin})
     push(fin)  # 폴더별로 돌고 있는 수정 요청(같은 덩어리는 줄 세우고, 다른 덩어리는 동시에)
 
@@ -1187,7 +1209,7 @@ def _ask_run(b, push):
             jid = b.get("_jid") or pysecrets.token_hex(8)
             meta = {"k": k, "mode": mode, "how": how, "sid": info and info["sid"], "mt0": mt0, "t0": t0, "log": str(JOBDIR / f"{jid}.out")}
             sid, out, err = session_run(res + tools, prompt, cwd, lambda t: push({"e": "text", "d": t}),
-                                        lambda n, a: push({"e": "tool", "name": n, "arg": a}), timeout=900 if mode == "edit" else 600,
+                                        lambda n, a: push({"e": "tool", "name": n, "arg": a}), timeout=3600 if mode == "edit" else 1800,
                                         on_init=(lambda x: push({"e": "thread", "sid": x})) if how != "cont" else None,
                                         log=JOBDIR / f"{jid}.out", on_pid=lambda pid: _job_meta(jid, dict(meta, pid=pid)))
             if err and how == "cont" and not out and attempt == 0:  # 이 창의 갈래가 사라졌으면 만든 세션에서 다시 갈라 시작
@@ -1201,6 +1223,8 @@ def _ask_run(b, push):
         stop.set()
         changed = bool(p and p.exists() and p.stat().st_mtime != mt0)
         fin = {"e": "err", "msg": err} if err and not out else {"e": "done", "changed": changed, "sec": round(time.time() - t0), "how": how, "err": err}
+        if mode == "edit" and not changed:
+            fin["src"] = _src_changed(p, t0)
         if b.get("_jid"):
             _job_meta(b["_jid"], {"final": fin})
         push(fin)
@@ -2336,6 +2360,7 @@ TRACKER_JS = r"""
       if (q === 'float') { P.side = false; FOCUS = P; return glide(P); }
       if (q === 'flip') { SIDE = SIDE === 'left' ? 'right' : 'left'; try { localStorage.setItem('wimaskside', SIDE); } catch {} return glide(P); }
       if (q === 'jump') return jumpChg();
+      if (q === 'cont') { setMode(P, 'edit'); P.el.querySelector('textarea').value = '중간에 끊긴 앞 요청을 이어서 마무리해. 이미 쓴 _raw 조사 메모와 고친 원본을 다시 읽고, 남은 절을 다 쓴 뒤 빌드까지 끝내'; return sendAsk(P); }
       if (q === 'reload') { try { sessionStorage.setItem('wimgo', JSON.stringify({a: anchor(), r: ratio()})); } catch {} savePanes(); return location.reload(); }
       if (FOCUS !== P) { FOCUS = P; layout(); } });
     return P;
@@ -2443,8 +2468,11 @@ TRACKER_JS = r"""
     await LIVE; clearInterval(tick); ta.classList.remove('cur'); item.dataset.run = '0';
     const live = item.querySelector('.live'); live.classList.add('end'); live.querySelector('.sp')?.remove();
     if (fin?.err && !fin.sec) { stage('실패'); ta.innerHTML = md(txt) + `<p style="color:var(--k-warn)">[실패] ${esc(fin.err)}</p>`; }
-    else { stage(fin?.changed ? (nchg ? '끝 · 화면에 반영됨' : '끝 · 파일 고침') : mode === 'edit' ? '끝 · 파일 변화 없음' : '끝');
+    else { const half = !fin?.changed && fin?.src?.length;
+      stage(fin?.changed ? (nchg ? '끝 · 화면에 반영됨' : '끝 · 파일 고침') : half ? '멈춤 · 원본만 고침(빌드 안 됨)' : mode === 'edit' ? '끝 · 파일 변화 없음' : '끝');
       if (!txt) ta.innerHTML = '';
+      if (fin?.err) item.insertAdjacentHTML('beforeend', `<p style="color:var(--k-warn)">${esc(fin.err)}</p>`);
+      if (half) item.insertAdjacentHTML('beforeend', `<div class="ok">조사·원본 수정은 됐지만 빌드 전에 끝났습니다 · ${fin.src.length}개 파일<br><small>${fin.src.map(esc).join(' · ')}</small><button type="button" data-q="cont">이어서 마무리</button></div>`);
       if (fin?.changed) item.insertAdjacentHTML('beforeend', nchg && !stale
         ? `<div class="ok">화면에 바로 반영했습니다 · ${nchg}곳<button type="button" data-q="jump">바뀐 곳 보기</button><button type="button" class="lnk" data-q="reload">새로고침</button></div>`
         : `<div class="ok">HTML이 고쳐졌습니다 · 새로고침해야 보입니다<button type="button" data-q="reload">새로고침해서 보기</button></div>`); }

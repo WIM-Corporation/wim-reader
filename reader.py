@@ -1716,6 +1716,8 @@ TRACKER_JS = r"""
     .ask.edit button.p{background:var(--k-warn);border-color:var(--k-warn)}.ask button:disabled{opacity:.6}
     .card .q small{font-size:12px;color:var(--k-muted);font-weight:600}
     .ask{z-index:1}.ask.focus{z-index:3}.ask .ms{display:none}
+    /* 겹침 순서: 문서 위 질문 창(1~3)·표시 < 카드(20) < 하단 탭·기록(21) < 카드 안에서 연 질문 창(25) < 칩·알림(30) */
+    .ov{z-index:20}.dock,.hb,.hp{z-index:21}.ask.oncard,.work.oncard{z-index:25}.chip,.toast,.jump{z-index:30}
     .ask.mini{cursor:pointer;box-shadow:0 6px 18px #0004}.ask.mini .qs,.ask.mini .th,.ask.mini form{display:none}
     .ask.mini header{border-bottom:0}.ask.mini .si{display:none}.ask.mini .ms{display:block;flex:1;min-width:0;font-size:12px;color:var(--k-ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
     .ask.mini:hover{outline:2px solid color-mix(in srgb,var(--k-acc) 50%,transparent)}
@@ -2322,6 +2324,7 @@ TRACKER_JS = r"""
     for (const P of PANES) { const a = P.el; placeWork(P);
       P.mini = P.side && P !== FOCUS;
       a.classList.toggle('side', P.side); a.classList.toggle('mini', P.mini); a.classList.toggle('focus', P === FOCUS);
+      const oc = !!P.blk?.closest?.('.ov'); a.classList.toggle('oncard', oc); P.wk.classList.toggle('oncard', oc);  // 카드 안 글에서 연 창만 카드 위로
       a.style.width = ''; a.style.right = 'auto'; a.style.bottom = 'auto';
       a.querySelector('[data-q="side"]').hidden = P.side; a.querySelector('[data-q="flip"]').hidden = !P.side || P.mini;
       a.querySelector('[data-q="float"]').hidden = !P.side || P.mini || !rectOf(P); a.querySelector('[data-q="mini"]').hidden = !P.side || P.mini;

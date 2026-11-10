@@ -285,6 +285,9 @@ def save_doc(c, b):
         c.executemany("INSERT OR IGNORE INTO blocks(key, h, first_seen) VALUES(?,?,?)", [(k, str(h)[:40], now) for h in (b.get("seen") or [])[:20000]])
         c.executemany("INSERT INTO blocks(key, h, first_seen, read_at) VALUES(?,?,?,?) ON CONFLICT(key, h) DO UPDATE SET read_at=coalesce(read_at, excluded.read_at)",
                       [(k, str(h)[:40], now, now) for h in (b.get("reads") or [])[:20000]])
+        if b.get("acks"):  # 노랑(바뀐 곳)을 지나간 덩어리: 처음 본 때를 첫 방문으로 돌려 더는 '바뀐 곳'이 아니게
+            base = c.execute("SELECT min(first_seen) FROM blocks WHERE key=?", (k,)).fetchone()[0]
+            c.executemany("UPDATE blocks SET first_seen=? WHERE key=? AND h=?", [(base, k, str(h)[:40]) for h in b["acks"][:20000]])
         cov = b.get("cov")
         if isinstance(cov, dict):
             c.execute("UPDATE docs SET blk_total=?, blk_read=?, blk_new=?, read_pct=? WHERE key=?",
@@ -1691,9 +1694,6 @@ TRACKER_JS = r"""
     .rl{position:fixed;right:1px;top:3px;bottom:0;width:7px;cursor:pointer;opacity:.85}.rl:hover{width:12px;opacity:1}
     .rl b{position:absolute;left:0;width:100%;border-radius:1px;pointer-events:none}.rl b.r{background:#22a35a99}.rl b.u{background:#9aa0a644}.rl b.n{background:#f5b301}
     .rl i{position:absolute;left:-1px;right:-1px;border:1.5px solid var(--ac);border-radius:3px;pointer-events:none}
-    .bar{position:fixed;left:0;top:0;height:3px;width:100vw;pointer-events:none}
-    .bar i{position:absolute;left:0;top:0;height:3px;background:var(--ac);transition:width .2s}
-    .bar b{position:absolute;top:0;height:3px;width:2px;background:var(--mu)}
     .fab{position:fixed;right:14px;bottom:14px;width:38px;height:38px;border-radius:19px;border:1px solid var(--ln);background:var(--bg);color:var(--fg);
       opacity:.55;cursor:pointer;box-shadow:0 2px 8px #0002;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:600}
     .fab:hover{opacity:1}
@@ -1885,7 +1885,6 @@ TRACKER_JS = r"""
       .card .gal{grid-template-columns:repeat(2,minmax(0,1fr))}.card figure img{height:110px}}
   </style>
   <div class="rg"><i></i></div><div class="rl" title="문서 지도: 초록 읽음 · 회색 안 읽음 · 노랑 바뀐 곳 (누르면 이동, n 다음 안 읽은 곳)"></div>
-  <div class="bar"><i></i><b></b></div>
   <div class="toast" hidden></div>
   <div class="pan" hidden></div>
   <div class="ov" hidden><div class="card"><header><button data-x="back" title="이전 카드" hidden>← 이전</button><span class="sp"></span><span class="tag"></span>
@@ -1920,8 +1919,6 @@ TRACKER_JS = r"""
 
   function paint() {
     const r = ratio();
-    $('.bar i').style.width = ((COV ? COV.pct : D?.max_ratio || 0) * 100) + 'vw';  // 채운 막대 = 읽은 양, 세로 눈금 = 지금 위치
-    $('.bar b').style.left = (r * 100) + 'vw';
     $('.fab').textContent = D?.done_at ? '✓' : pct(COV ? COV.pct : r);
     if (!$('.pan').hidden) drawPanel();
   }
@@ -2643,7 +2640,7 @@ TRACKER_JS = r"""
   // 문서 DOM은 건드리지 않고(화면 반영 비교가 깨지지 않게) 그림자 DOM 위에 줄을 그린다.
   const RBSEL = 'h1,h2,h3,h4,h5,h6,p,li,pre,blockquote,figure,table,dt,dd,img,svg,iframe,video,canvas';
   const RBMEDIA = /^(FIGURE|IMG|SVG|svg|IFRAME|VIDEO|CANVAS|TABLE)$/;
-  let BL = [], RD = new Set(), KN = new Set(), FR = new Set(), RBASE = null, PEND = new Set(), SEENP = [], COV = null, RBVIS = new Map(), RBIO = null, RBT = 0;
+  let ACKP = [], BL = [], RD = new Set(), KN = new Set(), FR = new Set(), RBASE = null, PEND = new Set(), SEENP = [], COV = null, RBVIS = new Map(), RBIO = null, RBT = 0;
   const fnv = s => { let h = 0x811c9dc5; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return (h >>> 0).toString(36); };
   const bKey = el => {
     const tg = el.tagName.toUpperCase();
@@ -2674,7 +2671,14 @@ TRACKER_JS = r"""
       for (const b of out) if (docY(b.el.getBoundingClientRect()) + 8 < lim) { RD.add(b.h); PEND.add(b.h); } }
     BL = out; if (newSeen.length) { SEENP.push(...newSeen); if (!RBASE) RBASE = Date.now() / 1000; dirty = true; }
     RBIO?.disconnect(); RBVIS.clear();
-    RBIO = new IntersectionObserver(es => es.forEach(e => RBVIS.set(e.target, e.isIntersecting ? e.intersectionRect.height : 0)), {threshold: [0, .1, .25, .4, .6, .8, 1]});
+    // 바뀐 곳(노랑)은 화면에 한 번 들어왔다가 지나가면 지운다(읽음 확정과는 따로, 초록은 여전히 머문 시간으로만)
+    const byEl = new Map(BL.map(b => [b.el, b]));
+    RBIO = new IntersectionObserver(es => es.forEach(e => {
+      const was = RBVIS.get(e.target) > 0; RBVIS.set(e.target, e.isIntersecting ? e.intersectionRect.height : 0);
+      const b = byEl.get(e.target);
+      if (b && was && !e.isIntersecting && FR.has(b.h) && document.visibilityState === 'visible' && $('.ov').hidden) {
+        FR.delete(b.h); ACKP.push(b.h); dirty = true; rbCov(); rbDraw(); }
+    }), {threshold: [0, .1, .25, .4, .6, .8, 1]});
     BL.forEach(b => RBIO.observe(b.el));
     rbCov(); rbDraw();
   }
@@ -2698,7 +2702,7 @@ TRACKER_JS = r"""
     cur.dw += 500;
     if (cur.dw >= cur.need) { RD.add(cur.h); PEND.add(cur.h); FR.delete(cur.h); rbCov(); rbDraw(cur.h); }
   }, 500);
-  const rbBody = () => { const o = {}; if (PEND.size) { o.reads = [...PEND]; PEND.clear(); } if (SEENP.length) { o.seen = SEENP.splice(0); } if (COV) o.cov = COV; return o; };
+  const rbBody = () => { const o = {}; if (PEND.size) { o.reads = [...PEND]; PEND.clear(); } if (SEENP.length) { o.seen = SEENP.splice(0); } if (ACKP.length) { o.acks = ACKP.splice(0); } if (COV) o.cov = COV; return o; };
   const rbLoad = x => { RBASE = x.base || null; RD = new Set(x.read || []); KN = new Set([...(x.read || []), ...(x.known || [])]); FR = new Set(x.fresh || []); };
   // 그리기: 덩어리 왼쪽 여백에 세로 줄(읽음 초록·안 읽음 회색·바뀐 곳 노랑+옅은 칠), 오른쪽 끝에 문서 전체 지도
   const docY = r => r.top - viewTop() + top();

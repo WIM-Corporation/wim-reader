@@ -2655,7 +2655,9 @@ TRACKER_JS = r"""
     for (const el of all) {
       let nested = false; for (let p = el.parentElement; p && p !== document.body; p = p.parentElement) if (set.has(p)) { nested = true; break; }
       if (nested) continue;
-      const r = el.getBoundingClientRect(); if (r.height < 4 || r.width < 4) continue;  // 접힌 details 안·숨은 것은 세지 않는다
+      const r = el.getBoundingClientRect(); if (r.height < 4 || r.width < 4) continue;
+      // 접힌 details 안은 크롬이 크기를 남겨 두고 그리기만 건너뛴다(content-visibility). 보이지 않는 덩어리는 세지도 칠하지도 않는다. 펼치면 다시 센다
+      if (el.checkVisibility && !el.checkVisibility({visibilityProperty: true})) continue;
       const k0 = bKey(el); const t = el.tagName.toUpperCase();
       if (!RBMEDIA.test(t) && k0.length < t.length + 3) continue;  // 빈 문단
       const base = t + fnv(k0), n = cnt.get(base) || 0; cnt.set(base, n + 1);

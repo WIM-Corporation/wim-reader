@@ -1,6 +1,6 @@
 ---
 name: html-brief
-description: "Builds research briefs, reports and learning packs as figure-first local HTML (SVG diagrams + web photos, minimal text, light/dark mode, a one-page '한장' edition), checks them, builds them and opens them. Also merges a set of existing HTML pages into one lossless page per part (synthesis layer + full originals). Use when the user says \"make this an HTML\", \"HTML report\", \"brief\", \"one-pager\", \"merge these HTMLs into one\", \"one page per part\", \"learning pack\", \"more diagrams / architecture figures\", \"less text\", \"hard to read\", \"like this one\" with an HTML link, or in Korean \"html로 만들어\", \"html로 정리\", \"html 작성\", \"보고서 html\", \"브리프\", \"한장으로 합쳐\", \"html 하나로 뭉쳐\", \"병합해서 하나로\", \"파트별로 1장\", \"학습 팩\", \"그림/다이어그램/아키텍쳐 많이 넣어\", \"글자 줄여\", \"읽기 힘들다\", \"이거만큼\", or when rewriting an existing *_local.html. Rule of thumb from real use: accepted pages have ≤250 characters of prose per figure; rejected ones had 1,000+."
+description: "Builds research briefs, reports and learning packs as figure-first local HTML (SVG diagrams + web photos, minimal text, light/dark mode, a one-page '한장' edition), checks them, builds them and opens them. Also merges a set of existing HTML pages into one lossless page per part (synthesis layer + full originals), and exports an internal pack as a shareable PDF/docx edition (English when asked). Use when the user says \"make this an HTML\", \"HTML report\", \"brief\", \"one-pager\", \"merge these HTMLs into one\", \"one page per part\", \"learning pack\", \"more diagrams / architecture figures\", \"less text\", \"hard to read\", \"like this one\" with an HTML link, \"make it a PDF to send\", \"docx draft\", \"write it in English\", or in Korean \"html로 만들어\", \"html로 정리\", \"html 작성\", \"보고서 html\", \"브리프\", \"한장으로 합쳐\", \"html 하나로 뭉쳐\", \"병합해서 하나로\", \"파트별로 1장\", \"학습 팩\", \"그림/다이어그램/아키텍쳐 많이 넣어\", \"글자 줄여\", \"읽기 힘들다\", \"이거만큼\", or when rewriting an existing *_local.html. Rule of thumb from real use: accepted pages have ≤250 characters of prose per figure; rejected ones had 1,000+."
 ---
 
 # 그림 위주 HTML 브리프·팩 (Figure-first HTML briefs)
@@ -21,6 +21,7 @@ The difference between HTML pages readers accept and pages they send back is pro
 8. 로컬 단독 HTML이 기본이다. 호스팅·아티팩트는 유저가 요청할 때만.
 9. 탭 금지. 내용을 탭·토글로 숨기지 않고 한 페이지 아래로 이어 붙인다. 리더가 스크롤 깊이로 읽음을 판정하면 탭이 진행도를 망친다. 부 구분은 왼쪽 목차와 제목으로 한다. `"tabs": true`를 넣어도 build.py가 무시한다.
 10. 숫자는 `_raw`·`_data`에서만 가져온다. 미확인 값은 ★, 가격은 출처 URL과 등급을 붙인다. 글 속 "|" 구분자·">" 인용 금지, 수식은 유니코드(≤, ×, ²).
+11. 고쳐 쓸 때는 원래 형식·언어·다이어그램 비중을 그대로 둔다. 함께 받은 참고 자료는 내용 근거이지 형식을 바꾸라는 지시가 아니다. 영어 산출물은 영어로 고친다.
 
 ## 크기 고르기 (Brief or pack)
 
@@ -46,9 +47,9 @@ The difference between HTML pages readers accept and pages they send back is pro
 
 ## WIM Reader와 함께 쓰기 (optional)
 
-같은 저장소의 WIM Reader 서버(기본 `http://127.0.0.1:8770`)를 띄워 두면 로컬 HTML을 그 주소로 열어 읽음 진행도·북마크·메모를 남길 수 있고, 내용이 바뀐 HTML은 내용 해시로 알아채 읽음 표시를 지운다. 없어도 모든 산출물은 `file://`로 단독으로 열린다. 묶음 통합의 리더 URL은 `HTML_BRIEF_READER` 환경변수로 바꿀 수 있다.
+같은 저장소의 WIM Reader 서버(기본 `http://127.0.0.1:8770`)를 띄워 두면 로컬 HTML을 그 주소로 열어 덩어리(문단·그림·표) 단위 읽음·북마크·메모를 남길 수 있고, HTML을 고치면 바뀐 덩어리만 다시 안 읽음(노랑)으로 표시된다. 없어도 모든 산출물은 `file://`로 단독으로 열린다. 묶음 통합의 리더 URL은 `HTML_BRIEF_READER` 환경변수로 바꿀 수 있다.
 
-Pages work best when served by the WIM Reader in this repo (`http://127.0.0.1:8770`), which tracks scroll depth, bookmarks and notes. It is not required: every output opens standalone from disk.
+Pages work best when served by the WIM Reader in this repo (`http://127.0.0.1:8770`), which tracks which blocks you actually read, bookmarks and notes, and re-flags only the blocks that changed when you rebuild. It is not required: every output opens standalone from disk.
 
 ## 파일 (Files)
 
@@ -84,9 +85,38 @@ Pages work best when served by the WIM Reader in this repo (`http://127.0.0.1:87
 - 한글 경로는 인자로 오면 NFC, 디스크(macOS)에서는 NFD일 수 있다. merge_lib가 디스크 표기로 맞추므로 glob을 새로 짤 때도 그 BUNDLE을 쓴다.
 - `p01-star` 덤프는 다시 엮은 것이 아니라 손실을 막는 접힌 모음이다. 보고에 그렇다고 쓴다.
 
+## 외부 발송본 (Shareable PDF / docx / English edition)
+
+"이거 PDF로 해서 ~한테 보내줘", "docx 초안", "영어로", "정정 표 빼고 PDF 다시"처럼 내부 팩을 바깥 사람에게 줄 때는 내부 팩은 그대로 두고 상대용 파일을 따로 만든다(규칙 7).
+When an internal pack goes to someone outside, leave the pack as it is and build a separate file for them.
+
+1. 형식 고르기: 사용자가 말한 형식을 따른다.
+   - 슬라이드 덱: 단독 HTML(`<section class="slide">` 안에 `<svg viewBox="0 0 1280 720">` 한 장씩, `@page{size:13.333in 7.5in;margin:0}`) → PDF.
+   - 1~2쪽 요약: A4 단독 HTML(`@page { size: A4; margin: 11mm 13mm 10mm 13mm; }`) → PDF.
+   - 상대가 고쳐 쓸 문서나 docx라고 한 것: python-docx로 만든다.
+   - 예전에 보낸 외부본이 있으면 그 파일을 템플릿으로 복사해 고친다.
+2. 위치: 외부용 HTML은 팩 안 `<폴더>/_send/<이름>_EN_<YYMMDD>.html`에 둔다. PDF·docx도 같은 `_send/`에 만든다. 외부용 HTML은 공용 style.css를 쓰지 않는 단독 파일이라 build.py·check.py 대상이 아니다.
+3. 내용 고르기: 상대에게 필요한 것만 옮긴다.
+   - 빼는 것: 점수·원가·마진·내부 평가, 정정 표, ★ 내부 메모와 추정 표시, 다른 고객사 이름, 사용자가 지우라고 한 절.
+   - 정정 표를 빼면 고친 결과를 주제로 삼아 다시 쓴다.
+   - 그림은 내부 팩의 아키텍처·토폴로지 다이어그램을 그대로 옮기고 글자만 줄인다.
+4. 언어: 영어라고 하면 그림 속 글자까지 전부 영어다. 숫자·단위·이름은 `_raw`의 원문 값을 그대로 쓴다.
+5. PDF 만들기: Chrome/Chromium 헤드리스(`CHROME` 환경변수로 경로 지정 가능).
+   `"$CHROME" --headless=new --disable-gpu --no-pdf-header-footer --print-to-pdf="<절대경로>.pdf" "file://<절대경로>.html"`
+   입력 PDF의 그림이 필요하면 `pdfimages -png <in.pdf> <dir>/p`(poppler)로 뽑는다.
+6. docx 만들기: uv 인라인 의존성(`python-docx`) 스크립트로 만든다. 차트는 matplotlib PNG를 `add_picture(width=Inches(6.3))`와 기울임 캡션으로 넣는다.
+7. 검사:
+   - PDF: `pdfinfo <pdf> | grep Pages`로 쪽수가 의도와 같은지(덱은 슬라이드 수, 요약은 1~2쪽) 보고, `pdftoppm -r 70 -png <pdf> <임시폴더>/pg`로 찍어 잘림·겹침을 본다.
+   - docx: `soffice --headless --convert-to pdf <docx>` 뒤 같은 방법으로 본다.
+   - 내부 내용이 새지 않았는지 `pdftotext <pdf> - | grep -n -E '★|원가|마진|내부|정정|TODO'`와 다른 고객사 이름으로 확인한다. 결과 파일은 연다.
+8. 넘기기: 이 스킬은 보내지 않는다. 팩의 `_build/AUTHORING.md`에 "외부본 경로·날짜·받는 사람·발송 여부"를 한 줄 남긴다.
+
 ## 함정 (Pitfalls)
 
 - 조각에 `style=`·`fill=`·hex 색을 쓰면 다크모드에서 글자가 사라진다. 클래스로만 칠한다.
 - `<h2>` id에 `pNN-` 접두사가 없으면 한장 판에서 목차 링크가 겹친다(build.py가 `! 한 장 판 id 중복`으로 알린다).
 - SVG 글자 폭은 한글 14px, 영문 7.5px로 잡는다. check.py 경고를 무시하면 상자 밖으로 삐져나온다.
+- 고쳐 달라는 산출물을 다른 양식으로 바꾸지 않는다. 영문 SVG 덱을 고치다 한국어 글 위주 문서로 바꾸면 다시 쓰라는 말을 듣는다. 형식이 애매하면 지금 고치던 파일의 템플릿을 기본값으로 삼는다.
+- 외부용 단독 HTML도 탭으로 나누지 않는다(규칙 9).
+- 외부본에 쓴 숫자가 내부 팩·메일 본문과 어긋나면 안 된다. 사용자가 숫자를 바꾸면 외부본·메일 본문·내부 팩을 같은 턴에 같이 고친다.
 - `_build/`·`_raw/`·`_img/`처럼 밑줄 폴더는 작업용이다. 산출물 HTML은 작업폴더 바로 아래에 둔다. 사진은 `_img/`에 두고 HTML과 함께 옮긴다(상대 경로).

@@ -8,6 +8,9 @@ usage: uv run <skill>/scripts/check.py <작업폴더> [pages/NN_slug.html ...]
 - 금지 태그·인라인 색·블록인용·"|" 구분자 → 오류
 - 그림당 글자(그림 밖 글자 ÷ SVG·사진 수): 250 이하 통과, 600 초과 경고, 1000 초과 오류
 - 그림 없는 절(h2) → 오류. SVG 글자가 viewBox 밖으로 나가면 경고
+- 그림 안 글자도 센다(그림 밖 글만 세면 라벨에 절당 700~1,000자가 몰려도 통과해 '글자가 작고 많다'는 말을 듣는다):
+  절 글자 합계(그림 밖+그림 안) 700 초과 경고·1,000 초과 오류, 그림 하나에 라벨 글자 300·라벨 25개 초과 경고,
+  viewBox 폭 960 초과 경고(화면에서 글자가 작아진다), 라벨 절반 넘게 s-ts(작은 글자)면 경고, 접힌 글 절당 800 초과 경고
 - 그림 라벨 숫자가 _raw·_data·_context 원문에 없으면 "근거 없는 숫자" 경고 (원문 폴더가 없으면 검사 생략)
 """
 from __future__ import annotations
@@ -25,7 +28,7 @@ BANNED = [
     (r"#[0-9a-fA-F]{3,6}\b(?![^<]*</a>)(?=[^<>]*>)", "hex 색"),
     (r"^\s*>", "블록인용"),
 ]
-SCALE = {"s-ts": 0.82, "s-tm": 0.9, "s-mono": 0.95, "s-tb": 1.08}
+SCALE = {"s-ts": 0.89, "s-tm": 0.9, "s-mono": 0.95, "s-tb": 1.08}
 
 
 def corpus(root: Path) -> str | None:
@@ -50,6 +53,7 @@ def check(root: Path, path: Path, corp: str | None, min_svg: int) -> int:
         for m in re.finditer(pat, src, re.M):
             errs.append(f"L{src.count(chr(10), 0, m.start()) + 1}: {why}: {m.group(0)[:40]}")
     svgs = re.findall(r"<svg\b.*?</svg>", src, re.S)
+    small_total = [0, 0]
     for i, s in enumerate(svgs, 1):
         try:
             root_el = ET.fromstring(s)
@@ -63,6 +67,16 @@ def check(root: Path, path: Path, corp: str | None, min_svg: int) -> int:
         if root_el.get("width") or root_el.get("height"):
             errs.append(f"svg {i}: width/height 속성 금지")
         w, h = float(vb[2]), float(vb[3])
+        if w > 960:
+            warns.append(f"svg {i}: viewBox 폭 {w:.0f} (880 기준, 넓으면 화면에서 글자가 작아진다)")
+        labs = ["".join(el.itertext()).strip() for el in root_el.iter() if el.tag.endswith("text")]
+        lc = sum(len(re.sub(r"\s+", "", t)) for t in labs)
+        if lc > 300:
+            warns.append(f"svg {i}: 그림 안 글자 {lc} (300 이하, 설명을 라벨에 몰지 말고 그림을 단순하게)")
+        if len([t for t in labs if t]) > 25:
+            warns.append(f"svg {i}: 라벨 {len(labs)}개 (25 이하)")
+        nts = sum(1 for el in root_el.iter() if el.tag.endswith("text") and "s-ts" in (el.get("class") or "").split())
+        small_total[0] += nts; small_total[1] += len([t for t in labs if t])
         for el in root_el.iter():
             if el.get("id"):
                 errs.append(f"svg {i}: SVG 안 id {el.get('id')}")
@@ -100,6 +114,15 @@ def check(root: Path, path: Path, corp: str | None, min_svg: int) -> int:
             continue
         if not re.search(r"<svg\b|<img\b", s):
             errs.append(f"그림 없는 절: {hd[:30]}")
+        lab = sum(len(re.sub(r"\s+", "", re.sub(r"<[^>]+>", "", t))) for t in re.findall(r"<text\b[^>]*>(.*?)</text>", s, re.S))
+        out = len(re.sub(r"\s+", "", re.sub(r"<svg\b.*?</svg>|<details\b.*?</details>|<[^>]+>", "", s, flags=re.S)))
+        dt = sum(len(re.sub(r"\s+", "", re.sub(r"<[^>]+>", "", d))) for d in re.findall(r"<details\b.*?</details>", s, re.S))
+        if out + lab > 1000:
+            errs.append(f"절 글자 합계 {out + lab}(그림 밖 {out}+그림 안 {lab}) 1,000 초과: {hd[:24]}")
+        elif out + lab > 700:
+            warns.append(f"절 글자 합계 {out + lab}(그림 밖 {out}+그림 안 {lab}) 700 초과: {hd[:24]}")
+        if dt > 800:
+            warns.append(f"접힌 글 {dt} (절당 800 이하): {hd[:24]}")
     nimg = len(re.findall(r"<img\b", src))
     text = len(re.sub(r"\s+", "", re.sub(r"<svg\b.*?</svg>|<details\b.*?</details>|<[^>]+>", "", src, flags=re.S)))
     per = text // max(1, len(svgs) + nimg)
@@ -110,6 +133,8 @@ def check(root: Path, path: Path, corp: str | None, min_svg: int) -> int:
         warns.append(f"그림당 글자 {per} (목표 250 이하)")
     elif per > 250:
         warns.append(f"그림당 글자 {per} (목표 250 이하, 600까지 허용)")
+    if small_total[1] and small_total[0] / small_total[1] > 0.5:
+        warns.append(f"그림 라벨 {small_total[1]}개 중 {small_total[0]}개가 작은 글자(s-ts): 본문 라벨은 s-t(14), s-ts는 단위·각주만")
     if len(svgs) < min_svg:
         warns.append(f"SVG {len(svgs)}개 (목표 {min_svg} 이상)")
     for w_ in warns[:30]:

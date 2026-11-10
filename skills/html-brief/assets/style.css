@@ -71,7 +71,7 @@ h2.part{border-top:0;color:var(--acc);margin-top:30px}
 .s-arrow{fill:var(--muted)}.s-arrow-acc{fill:var(--acc)}.s-arrow-warn{fill:var(--warn)}.s-arrow-ok{fill:var(--ok)}
 .s-f-acc{fill:var(--acc)}.s-f-warn{fill:var(--warn)}.s-f-ok{fill:var(--ok)}.s-f-lime{fill:var(--lime)}.s-f-blue{fill:var(--blue)}.s-f-violet{fill:var(--violet)}.s-f-muted{fill:var(--muted)}.s-f-star{fill:var(--star)}
 .s-t{fill:var(--ink);font-size:14px}
-.s-ts{fill:var(--ink);font-size:11.5px}
+.s-ts{fill:var(--ink);font-size:12.5px}
 .s-tm{fill:var(--muted);font-size:12.5px}
 .s-ta{fill:var(--acc);font-size:14px;font-weight:700}
 .s-tw{fill:var(--warn);font-size:14px;font-weight:700}

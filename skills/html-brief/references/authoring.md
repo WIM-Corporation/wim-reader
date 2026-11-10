@@ -40,11 +40,17 @@
 ## SVG 규칙
 
 - `viewBox="0 0 880 H"`, H는 220~520. `width`/`height` 속성 금지.
+- 그림 안 글자도 글이다. 그림 밖 글을 줄이려고 설명을 라벨로 옮기면 안 된다(글자가 작고 많다는 말을 듣는다).
+  - 절 글자 합계(그림 밖 + 그림 안 라벨, 공백 제외) 700 이하. 1,000을 넘으면 check.py 오류다. 독자가 받아들인 장은 절당 300~600이었다.
+  - 그림 하나에 라벨 글자 300 이하, 라벨 25개 이하. 라벨은 명사·숫자·짧은 구로, 설명은 캡션 한 줄로.
+  - 라벨 본문은 `s-t`(14). `s-ts`는 단위·각주·출처에만 쓴다(라벨 절반 넘게 s-ts면 경고). 화면에서 13px 아래 글자를 만들지 않는다.
+  - viewBox 폭은 880을 지킨다. 1040처럼 넓히면 본문 칸에 맞춰 줄면서 12px 라벨이 10~11px가 된다.
+  - 절 하나에 그림 3개를 넣어 라벨을 늘리지 않는다. 그림이 셋 필요하면 절을 나눈다. 접힌 `<details>`도 절당 800자 이하.
 - 색은 클래스로만 준다. hex·rgb·`style=`·`fill=`·`stroke=` 속성·`<style>`·`<defs>` 금지(다크모드가 깨진다). 예외: `fill="none"`.
 - 상자: `s-box`(중립) `s-box2` `s-paper` `s-acc`(강조) `s-warn`(위험·병목) `s-ok`(정상·기회) `s-star`(미확인) `s-dash`(점선 묶음). 등장 주체 색 셋(자사·경쟁사·파트너 등 원하는 대로): `s-lime` `s-blue` `s-violet` (선 `s-lime-line …`, 채움 `s-f-lime …`, 글자 `s-tlime s-tblue s-tviolet`)
 - 국가 비교(순서 KR→JP→US→CN): 상자 `s-kr s-jp s-us s-cn`, 선 `s-kr-line …`, 채움 `s-f-kr …`, 글자 `s-tkr s-tjp s-tus s-tcn`
 - 선: `s-line` `s-acc-line` `s-warn-line` `s-ok-line`. 채움(막대·점): `s-f-acc s-f-warn s-f-ok s-f-muted s-f-star`
-- 글자: `s-tb`(굵은 제목 15) `s-t`(본문 14) `s-ts`(작게 11.5) `s-tm`(회색 12.5) `s-mono`(코드) `s-ta s-tw s-tok s-tstar`(색 강조)
+- 글자: `s-tb`(굵은 제목 15) `s-t`(본문 14) `s-ts`(작게 12.5) `s-tm`(회색 12.5) `s-mono`(코드) `s-ta s-tw s-tok s-tstar`(색 강조)
 - 화살표: 선에 `marker-end="url(#ar)"`(회색) `#ar-acc` `#ar-warn` `#ar-ok`. 마커는 셸에 이미 있다.
 - 그 밖의 도메인 색이 필요하면 `_build/extra.css`에 변수·클래스를 같은 방식(라이트·다크 둘 다)으로 더한다.
 - 상자는 `rx="8"`. 글자는 상자 안에 들어가게 폭을 잡는다(한글 14px 한 글자 약 14px, 영문 약 7.5px). 겹침 금지. 가운데 정렬은 `text-anchor="middle"`.

@@ -1743,6 +1743,7 @@ TRACKER_JS = r"""
     .ask .row2{display:flex;align-items:center;gap:8px}.ask .hint{flex:1;font-size:11.5px;color:var(--k-muted)}
     .ask .seg{display:inline-flex;border:1px solid var(--k-line);border-radius:8px;overflow:hidden}
     .ask .seg button{border:0;border-radius:0;padding:5px 11px;color:var(--k-muted);background:none}
+    .ask .seg{display:none}
     .ask .seg button.on{background:var(--k-acc);color:var(--k-paper);font-weight:700}.ask .seg button[data-m="edit"].on{background:var(--k-warn)}
     .ask button.p{background:var(--k-acc);border-color:var(--k-acc);color:var(--k-paper);font-weight:700;padding:5px 14px}
     .ask.edit button.p{background:var(--k-warn);border-color:var(--k-warn)}.ask button:disabled{opacity:.6}
@@ -1899,7 +1900,7 @@ TRACKER_JS = r"""
   <div class="work" hidden><b></b></div><button class="jump" hidden></button>
   <button class="hb" title="설명 카드 기록 — 지금까지 만든 카드 다시 열기">카드</button>
   <div class="hp" hidden><header><b>설명 카드 기록</b> <span class="mu cnt"></span><span class="hsc"><button data-h="doc" class="on">이 문서</button><button data-h="all">전체</button></span><input placeholder="용어·문서 검색"></header><div class="ls"></div></div>
-  <div class="chip" hidden><button data-c="e" title="설명 카드 (e) · 카드 아래 입력창으로 더 묻고, 다 보면 'HTML에 반영'">설명·질문</button></div>
+  <div class="chip" hidden><button data-c="e" title="설명·질문 카드 (e) · 카드 아래 입력창으로 더 묻는다">설명·질문</button><button data-c="a" title="이 문서를 만든 세션이 고른 곳을 고친다 (a)">HTML 수정</button></div>
   <div class="ask" hidden><header><b>만든 세션에 묻기</b><small class="si"></small><small class="ms"></small><button class="hb2" data-q="side" title="옆으로 작게 (본문 보면서)">옆으로 ▸</button><button class="hb2" data-q="flip" title="반대쪽으로" hidden>⇄</button><button class="hb2" data-q="float" title="고른 곳 옆에 크게" hidden>⤢</button><button class="hb2" data-q="mini" title="접기" hidden>–</button><button class="x" data-q="x" title="닫기 (Esc) · 돌고 있으면 접힘">×</button></header>
     <div class="qs"></div><div class="th"></div>
     <form><textarea rows="2"></textarea><div class="row2"><span class="seg"><button type="button" data-m="ask" class="on">질문</button><button type="button" data-m="edit">HTML 수정</button></span>
@@ -2426,7 +2427,8 @@ TRACKER_JS = r"""
     let P = PANES.find(x => !x.busy && !x.el.querySelector('.th').children.length);
     if (P) { Object.assign(P, {range: p.range || null, doc: p.odoc || document, sel: p.term, ctx: p.ctx, head: p.head, blk, sig: sigOf(blk), side: false});
       P.el.querySelector('.qs').innerHTML = '<b>고른 부분</b>' + esc(p.term.length > 600 ? p.term.slice(0, 600) + '…' : p.term); }
-    else P = newPane({range: p.range, doc: p.odoc, sel: p.term, ctx: p.ctx, head: p.head, blk, mode: PANES.at(-1)?.mode});
+    else P = newPane({range: p.range, doc: p.odoc, sel: p.term, ctx: p.ctx, head: p.head, blk, mode: 'edit'});
+    setMode(P, 'edit');  // 질문은 설명·질문 카드로 합쳤다. 이 창은 HTML 수정 전용
     FOCUS = P; glide(P); P.el.querySelector('textarea').focus();
   };
   // ---- 화면에 바로 반영: 고친 파일을 다시 받아 이전 파일과 비교하고, 바뀐 가장 작은 덩어리만 화면 DOM에서 바꾼다(창이 여럿이어도 한 줄로) ----
@@ -2559,7 +2561,7 @@ TRACKER_JS = r"""
   try { JSON.parse(localStorage.getItem(DK) || '[]').filter(x => (x.page || x.k) === K).forEach(x => { const S = session(x); SS.push(S); if (x.st === 'run') run(S); }); } catch {}
   paintDock();
   $('.chip').addEventListener('mousedown', e => e.preventDefault());  // 선택이 풀리지 않게
-  $('.chip').addEventListener('click', e => { const c = e.target.closest('[data-c]')?.dataset.c, p = pick || anyPick(); if (c) explain(p); });
+  $('.chip').addEventListener('click', e => { const c = e.target.closest('[data-c]')?.dataset.c, p = pick || anyPick(); if (c === 'a') openAsk(p); else if (c) explain(p); });
   $('.card form').addEventListener('submit', e => { e.preventDefault(); const i = $('.card input'), q = i.value.trim();
     if (!q || !X || X.busy) return; i.value = ''; const S0 = X;
     sessOf(S0.k).then(si => si?.sid ? askCard(S0, q) : ask(S0, {term: S0.term, ctx: S0.ctx, head: S0.head, q, prev: S0.last}, '↳ ' + q)); });
@@ -2625,7 +2627,7 @@ TRACKER_JS = r"""
     if (e.metaKey || e.ctrlKey || e.altKey || e.isComposing) return;
     const t = e.composedPath()[0] || e.target; if (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)) return;
     if (e.key === 'f' && !$('.ov').hidden) { e.preventDefault(); return setFull(!FULL, true); }
-    const f = {a: () => explain(anyPick()), e: () => explain(anyPick()), b: () => addMark(false), m: () => addMark(true), d: toggleDone, '[': () => jumpMark(-1), ']': () => jumpMark(1), n: () => nextUnread(1), N: () => nextUnread(-1)}[e.key];
+    const f = {a: () => openAsk(anyPick()), e: () => explain(anyPick()), b: () => addMark(false), m: () => addMark(true), d: toggleDone, '[': () => jumpMark(-1), ']': () => jumpMark(1), n: () => nextUnread(1), N: () => nextUnread(-1)}[e.key];
     if (f) { e.preventDefault(); f(); }
   };
   addEventListener('keydown', onKey);

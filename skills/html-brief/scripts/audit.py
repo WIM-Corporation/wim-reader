@@ -24,6 +24,8 @@ def plain(x: str) -> str:
 
 
 def sections(s: str):
+    mcol = re.search(r"main\s*\{[^}]*max-width:\s*(\d+)px", s)
+    col = int(mcol.group(1)) - 60 if mcol else 880  # 본문 칸 폭(패딩 뺀 근사). 칸이 viewBox보다 넓으면 글자가 줄지 않는다
     body = re.sub(r"<(script|style)\b.*?</\1>", "", s, flags=re.S | re.I)
     parts = re.split(r"(?=<h2\b)", body)[1:]
     for p in parts:
@@ -42,7 +44,7 @@ def sections(s: str):
             flags.append(f"그림 안 글자 그림당 {per_txt}")
         if svgs and per_lab > LIM["labels"]:
             flags.append(f"라벨 그림당 {per_lab}개")
-        if vbw and max(vbw) > LIM["vbw"]:
+        if vbw and max(vbw) > LIM["vbw"] and max(vbw) > col:
             flags.append(f"viewBox 폭 {max(vbw):.0f}(글자 작아짐)")
         tot = prose + sum(map(len, labels))
         if tot > LIM["sec"]:

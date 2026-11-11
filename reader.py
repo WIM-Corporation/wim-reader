@@ -1212,7 +1212,7 @@ def _ask_run(b, push):
                 rule += " 지금 같은 문서의 다른 곳을 동시에 고치는 요청이 있다. 그 부분은 건드리지 않는다: " + " / ".join(f"«{o['sel']}»({o['q']})" for o in others)
         prompt = "\n".join([f"[WIM Reader에서 보낸 {'질문' if mode == 'ask' else 'HTML 수정 요청'}]", f"문서: {p or k}",
                              f"절: {b.get('head', '')[:200]}", f"사용자가 고른 부분: «{(b.get('sel') or '')[:2000]}»",
-                             f"주변 글: «{(b.get('ctx') or '')[:1500]}»", "", b["q"].strip()[:4000], "", rule])
+                             f"주변 글: «{(b.get('ctx') or '')[:1500]}»", "", b["q"].strip()[:14000], "", rule])
         tools = (["--tools", "Read,Grep,Glob,WebSearch,WebFetch", "--setting-sources", ""] if mode == "ask" else []) + ["--permission-mode", "bypassPermissions"]
         stop = threading.Event()
 
@@ -1878,6 +1878,8 @@ TRACKER_JS = r"""
     .card .sk{height:200px;border-radius:12px;background:linear-gradient(90deg,var(--k-line),var(--k-paper),var(--k-line));background-size:200% 100%;animation:sh 1.3s infinite linear}
     @keyframes sh{to{background-position:-200% 0}}
     .card form{display:flex;gap:8px;padding:12px 16px;border-top:1px solid var(--k-line);background:var(--k-paper)}
+    .card form .rf{flex:none;border:1px solid var(--k-acc);background:var(--k-acc);color:#fff;border-radius:9px;padding:0 14px;font-size:13.5px;font-weight:700;cursor:pointer}
+    .card form .rf:disabled{opacity:.45;cursor:default}.card .bd .q small{color:var(--k-muted)}
     .card input{flex:1;min-width:0;background:var(--k-bg);color:var(--k-ink);border:1px solid var(--k-line);border-radius:9px;padding:9px 12px;font-size:14px}
     .card .lb{position:absolute;inset:0;background:#000e;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;padding:24px;cursor:zoom-out}
     .card .lb img{max-width:100%;max-height:78%;background:#fff;border-radius:6px}
@@ -1892,12 +1894,12 @@ TRACKER_JS = r"""
     <button data-x="deep" title="동작 원리·수치·문서 주제와의 관계까지">자세히</button><button data-x="re" title="저장된 카드 말고 새로 쓰기">다시</button>
     <button data-x="full" title="전체화면 (f) · 넓은 화면에선 왼쪽에 목차">⤢ 전체화면</button><button data-x="min" title="하단 탭으로 내리기 (Esc) · 만드는 동안 계속 읽고, 끝나면 탭이 알려 줌">▾ 내리기</button><button class="x" data-x="close" title="하단 탭으로 내리기 (Esc)">×</button></header>
     <nav class="toc"></nav><div class="sc"></div>
-    <form><input placeholder="더 물어보기 (예: 그럼 이 문서의 경우는?)" enterkeyhint="send"></form><div class="lb" hidden></div></div></div>
+    <form><input placeholder="더 물어보기 (예: 그럼 이 문서의 경우는?)" enterkeyhint="send"><button type="button" class="rf" title="이 카드에서 조사·질문한 내용을 이 문서를 만든 세션이 HTML에 반영 (고르던 곳 옆에서 고치는 모습이 보임)">HTML에 반영</button></form><div class="lb" hidden></div></div></div>
   <div class="dock" hidden></div>
   <div class="work" hidden><b></b></div><button class="jump" hidden></button>
   <button class="hb" title="설명 카드 기록 — 지금까지 만든 카드 다시 열기">카드</button>
   <div class="hp" hidden><header><b>설명 카드 기록</b> <span class="mu cnt"></span><span class="hsc"><button data-h="doc" class="on">이 문서</button><button data-h="all">전체</button></span><input placeholder="용어·문서 검색"></header><div class="ls"></div></div>
-  <div class="chip" hidden><button data-c="e" title="개념 카드 (e)">설명</button><button data-c="a" title="이 문서를 만든 세션에 질문·수정 요청 (a)">질문·수정</button></div>
+  <div class="chip" hidden><button data-c="e" title="설명 카드 (e) · 카드 아래 입력창으로 더 묻고, 다 보면 'HTML에 반영'">설명·질문</button></div>
   <div class="ask" hidden><header><b>만든 세션에 묻기</b><small class="si"></small><small class="ms"></small><button class="hb2" data-q="side" title="옆으로 작게 (본문 보면서)">옆으로 ▸</button><button class="hb2" data-q="flip" title="반대쪽으로" hidden>⇄</button><button class="hb2" data-q="float" title="고른 곳 옆에 크게" hidden>⤢</button><button class="hb2" data-q="mini" title="접기" hidden>–</button><button class="x" data-q="x" title="닫기 (Esc) · 돌고 있으면 접힘">×</button></header>
     <div class="qs"></div><div class="th"></div>
     <form><textarea rows="2"></textarea><div class="row2"><span class="seg"><button type="button" data-m="ask" class="on">질문</button><button type="button" data-m="edit">HTML 수정</button></span>
@@ -1943,7 +1945,7 @@ TRACKER_JS = r"""
   };
   // ---------- 개념 카드(선택 → 칩 → claude 스트리밍: 글·mermaid 다이어그램·위키백과 그림) ----------
   const BLK = 'p,li,dd,dt,td,th,figcaption,h1,h2,h3,h4,h5,h6,pre,blockquote,caption,label,summary';
-  const PH = '더 물어보기 (예: 그럼 이 문서의 경우는?)';
+  const PH = '더 구체적으로 물어보기 — 이 문서를 만든 세션이 답합니다 (예: 그럼 이 문서의 경우는?)';
   let pick = null, X = null, MM = null, mmN = 0;
   const SVG = new Map(), hist = [];  // mermaid 코드 → svg(그리는 중이면 null)
   const clip = (t, term, n) => { t = (t || '').replace(/\s+/g, ' ').trim(); if (t.length <= n) return t;
@@ -2098,7 +2100,6 @@ TRACKER_JS = r"""
   const onSel = () => { clearTimeout(st); st = setTimeout(() => {
     pick = innerPick() || anyPick(); const c = $('.chip');
     if (!pick) { c.hidden = true; return; }
-    c.querySelector('[data-c="e"]').hidden = pick.term.length > 80;
     c.hidden = false; const w = c.offsetWidth || 44;
     c.style.left = Math.min(innerWidth - w - 8, Math.max(8, pick.rect.right - w / 2)) + 'px';
     c.style.top = (pick.rect.bottom + 34 > innerHeight ? pick.rect.top - 30 : pick.rect.bottom + 6) + 'px';
@@ -2107,18 +2108,22 @@ TRACKER_JS = r"""
   // 탭을 누르면 다시 열린다. 다른 페이지·새로고침에도 남도록 최근 12개를 localStorage에 둔다(카드 본문은 서버 캐시에서 다시 받음)
   const DK = 'wimdock', DMAX = 12, SS = [];
   const setTag = (S, t) => { S.tag = t; if (X === S) $('.card .tag').textContent = t; };
-  const setBusy = (S, on, ph) => { S.busy = on; S.ph = ph || PH; if (X === S) { const i = $('.card input'); i.disabled = on; i.placeholder = S.ph; } };
+  const setBusy = (S, on, ph) => { S.busy = on; S.ph = ph || PH; if (X === S) { const i = $('.card input'); i.disabled = on; i.placeholder = S.ph; rfState(S); } };
+  // 'HTML에 반영': 카드가 다 됐거나(설명) 물어본 답이 하나라도 있을 때만
+  const rfState = S => { const b = $('.card .rf'); if (!b) return; b.disabled = !S || S.busy || S.st === 'run' || (S.passage ? !S.last : S.bd.textContent.trim().length < 200); };
   // 하단 탭은 페이지마다 따로: 이 페이지에서 연 카드만 보인다(다른 페이지 것은 남겨 두고 덮어쓰지 않는다)
   const saveDock = () => { try { const all = JSON.parse(localStorage.getItem(DK) || '[]').filter(x => (x.page || x.k) !== K);
     localStorage.setItem(DK, JSON.stringify(all.concat(SS.slice(-DMAX).map(s => ({term: s.term, ctx: s.ctx, head: s.head, doc: s.doc,
-      k: s.k, page: K, title: s.title, st: s.st === 'run' ? 'run' : 'idle'}))).slice(-300))); } catch {} };
+      k: s.k, page: K, title: s.title, sig: s.sig, st: s.st === 'run' ? 'run' : 'idle'}))).slice(-300))); } catch {} };
   const session = x => {
     const S = {term: x.term, ctx: x.ctx || '', head: x.head || '', doc: x.doc || '', k: x.k || K, title: x.title || document.title,
-      last: '', st: 'idle', tag: '', busy: false, ph: PH, top: 0, t0: Date.now()};
+      sig: x.sig || '', passage: x.term.length > 80, last: '', st: 'idle', tag: '', busy: false, ph: PH, top: 0, t0: Date.now()};
     const v = S.view = document.createElement('div');
     v.innerHTML = '<h1><span class="num">개념</span><span class="tt"></span></h1><div class="ctx"></div><div class="gal"></div><div class="prog" hidden></div><div class="bd"></div>';
-    v.querySelector('.tt').textContent = S.term;
-    const ct = clip(S.ctx, S.term, 260), cx = v.querySelector('.ctx');
+    v.querySelector('.tt').textContent = S.passage ? S.term.slice(0, 60) + '…' : S.term;
+    if (S.passage) { v.querySelector('.num').textContent = '고른 부분'; S.st = 'done';  // 긴 구절은 개념 카드를 만들지 않고 바로 묻는다
+      v.querySelector('.bd').innerHTML = `<div class="ctx"><small>고른 부분</small>${esc(S.term.slice(0, 1500))}</div><p class="mu">아래 입력창에 묻고 싶은 것을 쓰세요. 이 문서를 만든 세션이 답하고, 다 보면 'HTML에 반영'으로 문서에 넣을 수 있습니다.</p>`; }
+    const ct = S.passage ? '' : clip(S.ctx, S.term, 260), cx = v.querySelector('.ctx');
     cx.innerHTML = ct ? '<small>문서 속 문장</small>' + esc(ct).split(esc(S.term)).join(`<mark>${esc(S.term)}</mark>`) : ''; cx.hidden = !ct;
     Object.assign(S, {bd: v.querySelector('.bd'), gal: v.querySelector('.gal'), prog: v.querySelector('.prog')});
     return S;
@@ -2130,7 +2135,8 @@ TRACKER_JS = r"""
     X = S; S.unseen = false; theme();
     const c = $('.card'), sc = c.querySelector('.sc'); sc.replaceChildren(S.view);
     c.querySelector('[data-x="back"]').hidden = !hist.length; c.querySelector('.tag').textContent = S.tag;
-    const i = c.querySelector('input'); i.disabled = S.busy; i.placeholder = S.ph;
+    const i = c.querySelector('input'); i.disabled = S.busy; i.placeholder = S.passage ? '이 부분에 대해 물어보기 — 이 문서를 만든 세션이 답합니다' : S.ph;
+    rfState(S); if (S.passage) setTimeout(() => i.focus(), 50);
     c.querySelector('.lb').hidden = true; $('.ov').hidden = false; sc.scrollTop = S.top || 0;
     if (S.st === 'idle' || S.st === 'fail') run(S);  // 실패한 카드는 누르면 다시 만든다
     $('.ov').classList.toggle('full', FULL); toc();
@@ -2244,20 +2250,20 @@ TRACKER_JS = r"""
       f.innerHTML = `<b>카드를 끝까지 못 만들었습니다</b><span>${esc(failMsg)}</span><button data-x="re">다시 시도</button>`; box.after(f); }
     box.className = ''; paint(); if (cache) pg.hidden = true;
     if (!gal.dataset.done) gal.innerHTML = '';
-    S.last = acc; S.st = fin ? 'done' : 'fail';
+    S.last = acc; S.st = fin ? 'done' : 'fail'; if (X === S) rfState(S);
     setTag(S, cache ? '저장된 카드' : fin ? (stat ? `조사 ${stat.lanes}갈래 · 검증 ${stat.checks}건 · 수정 ${stat.fixed}건` : '') : '');
     setBusy(S, false);
     if (X !== S && !cache && SS.includes(S)) { S.unseen = true; toast(`‘${esc(S.term)}’ 카드 ${fin ? '완성' : '실패'}`, 9000, [['열기', () => { hist.length = 0; open(S); }]]); }
     saveDock(); paintDock();
   }
   const explain = p => {
-    if (!p) return; if (p.term.length > 80) return openAsk(p); $('.chip').hidden = true;
+    if (!p) return; $('.chip').hidden = true;
     try { p.odoc?.getSelection().removeAllRanges(); getSelection().removeAllRanges(); R.getSelection?.()?.removeAllRanges(); } catch {}
     const doc = p.inner ? X?.doc : p.doc;
     if (p.inner && X) hist.push(X); else if (!p.inner) hist.length = 0;
     let S = SS.find(s => s.term === p.term && s.k === K);
     if (S) SS.splice(SS.indexOf(S), 1);  // 같은 용어면 그 탭을 맨 앞(최근)으로
-    else { S = session({term: p.term, ctx: p.ctx, head: p.head, doc});
+    else { S = session({term: p.term, ctx: p.ctx, head: p.head, doc, sig: p.inner ? X?.sig : sigOf(blkOf(p.range))});
       while (SS.length >= DMAX) { const o = SS.find(s => s.st !== 'run' && s !== X && !hist.includes(s)) || SS[0]; o.ctl?.abort(); SS.splice(SS.indexOf(o), 1); } }
     SS.push(S); open(S);
   };
@@ -2280,7 +2286,7 @@ TRACKER_JS = r"""
     if (S) { SS.splice(SS.indexOf(S), 1); if (S.st === 'idle') S.st = 'load'; }
     if (!S || S.st === 'load') {
       S = S || session({term: x.term, k: x.key, title: $('.hp [data-id="' + id + '"] small')?.textContent.split(' · ')[0] || x.key});
-      S.st = 'done'; S.prog.hidden = true; S.gal.innerHTML = ''; S.gal.dataset.done = '';
+      S.st = 'done'; S.prog.hidden = true; S.gal.innerHTML = ''; S.gal.dataset.done = ''; if (X === S) rfState(S);
       const m = x.answer.match(/^IMG:(.*)\n/m); if (m) { S.gal.dataset.done = 1; loadImgs(m[1], S.gal); }
       S.bd.innerHTML = md(x.answer); fillMM(S.bd); S.last = x.answer; S.tag = '저장된 카드 · ' + ago2(x.created_at);
     }
@@ -2553,10 +2559,19 @@ TRACKER_JS = r"""
   try { JSON.parse(localStorage.getItem(DK) || '[]').filter(x => (x.page || x.k) === K).forEach(x => { const S = session(x); SS.push(S); if (x.st === 'run') run(S); }); } catch {}
   paintDock();
   $('.chip').addEventListener('mousedown', e => e.preventDefault());  // 선택이 풀리지 않게
-  $('.chip').addEventListener('click', e => { const c = e.target.closest('[data-c]')?.dataset.c, p = pick || anyPick(); if (c === 'a') openAsk(p); else if (c) explain(p); });
+  $('.chip').addEventListener('click', e => { const c = e.target.closest('[data-c]')?.dataset.c, p = pick || anyPick(); if (c) explain(p); });
   $('.card form').addEventListener('submit', e => { e.preventDefault(); const i = $('.card input'), q = i.value.trim();
     if (!q || !X || X.busy) return; i.value = ''; const S0 = X;
     sessOf(S0.k).then(si => si?.sid ? askCard(S0, q) : ask(S0, {term: S0.term, ctx: S0.ctx, head: S0.head, q, prev: S0.last}, '↳ ' + q)); });
+  $('.card .rf').addEventListener('click', () => { const S = X; if (!S || S.busy) return;
+    const t = S.bd.innerText.replace(/\n{3,}/g, '\n\n'), body = t.length > 12000 ? t.slice(0, 8000) + '\n…(중간 생략)…\n' + t.slice(-4000) : t;  // 카드 본문 + 이어서 물어본 것·답(↳)
+    const q = `이 문서에서 '${S.passage ? S.term.slice(0, 80) + '…' : S.term}'을 고르고 설명 카드로 조사·질문했다. 그 결과(아래)를 이 문서의 해당 부분에 반영해라. `
+      + '문서에 이미 있는 내용과 겹치는 것은 빼고, 새로 알게 된 원리·숫자·출처·판단만 이 문서의 양식(그림 위주, 절 글자 합계 700 이하)으로 넣는다. 카드 문장을 그대로 붙여 넣지 않는다.\n\n[카드 내용]\n' + body;
+    const f = findBySig(S.sig), blk = f?.el || null;
+    const P = newPane({sel: S.term.slice(0, 600), ctx: S.ctx, head: S.head, blk, doc: f?.doc || document, sig: S.sig, mode: 'edit'});
+    P.el.querySelector('textarea').value = q; minimize(); FOCUS = P; glide(P); sendAsk(P);
+    toast(`'${S.term.slice(0, 20)}' 조사 내용을 HTML에 반영하는 중 · 고르던 곳 옆 창에서 진행이 보입니다`, 5000);
+  });
   const escCard = () => { const lb = $('.card .lb'); if (!lb.hidden) lb.hidden = true; else minimize(); };
   $('.card').addEventListener('keydown', e => { e.stopPropagation(); if (e.key === 'Escape') escCard();
     else if (e.key === 'f' && !e.metaKey && !e.ctrlKey && !/^(INPUT|TEXTAREA)$/.test((e.composedPath()[0] || e.target).tagName)) { e.preventDefault(); setFull(!FULL, true); } });  // 페이지 단축키로 새지 않게
@@ -2610,7 +2625,7 @@ TRACKER_JS = r"""
     if (e.metaKey || e.ctrlKey || e.altKey || e.isComposing) return;
     const t = e.composedPath()[0] || e.target; if (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)) return;
     if (e.key === 'f' && !$('.ov').hidden) { e.preventDefault(); return setFull(!FULL, true); }
-    const f = {a: () => openAsk(anyPick()), e: () => explain(anyPick()), b: () => addMark(false), m: () => addMark(true), d: toggleDone, '[': () => jumpMark(-1), ']': () => jumpMark(1), n: () => nextUnread(1), N: () => nextUnread(-1)}[e.key];
+    const f = {a: () => explain(anyPick()), e: () => explain(anyPick()), b: () => addMark(false), m: () => addMark(true), d: toggleDone, '[': () => jumpMark(-1), ']': () => jumpMark(1), n: () => nextUnread(1), N: () => nextUnread(-1)}[e.key];
     if (f) { e.preventDefault(); f(); }
   };
   addEventListener('keydown', onKey);

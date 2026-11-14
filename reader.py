@@ -1052,12 +1052,16 @@ def _parse_stream(lines, on_text, on_tool=None, on_init=None):
     return sid, out, err
 
 
-def session_run(extra, prompt, cwd, on_text, on_tool=None, timeout=900, on_init=None, log=None, on_pid=None):
+# 안전장치 오탐으로 막힌 요청을 사용자가 그 요청 하나만 다른 모델로 다시 돌릴 때 고를 수 있는 모델(자동으로 바꾸지 않는다)
+ALT_MODELS = {"claude-opus-4-8", "claude-sonnet-5-5"}
+
+
+def session_run(extra, prompt, cwd, on_text, on_tool=None, timeout=900, on_init=None, log=None, on_pid=None, model=None):
     """claude -p를 cwd에서 돌린다(이어받기 인자는 extra). (새 세션 id, 답, 오류)를 돌려준다.
     log를 주면 출력을 그 파일에 쓰고 claude를 따로 된 프로세스 그룹으로 띄운다: 리더 서버가 재시작돼도 claude는 계속 돌고 서버가 파일을 다시 이어 읽는다."""
     env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDECODE", "CLAUDE_CODE_"))}
     env["CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"] = "0"  # 백그라운드 에이전트를 10분 만에 끊지 않고 끝까지 기다린다(전체 시간 제한은 아래 timer)
-    cmd = [CLAUDE, "-p", "--model", DEEP_MODEL, "--output-format", "stream-json", "--verbose", "--include-partial-messages", *extra, prompt]
+    cmd = [CLAUDE, "-p", "--model", model or DEEP_MODEL, "--output-format", "stream-json", "--verbose", "--include-partial-messages", *extra, prompt]
     if log:
         log.parent.mkdir(parents=True, exist_ok=True)
         with open(log, "w") as fo, open(str(log) + ".err", "w") as fe:
@@ -1244,7 +1248,8 @@ def _ask_run(b, push):
             sid, out, err = session_run(res + tools, prompt, cwd, lambda t: push({"e": "text", "d": t}),
                                         lambda n, a: push({"e": "tool", "name": n, "arg": a}), timeout=3600 if mode == "edit" else 1800,
                                         on_init=(lambda x: push({"e": "thread", "sid": x})) if how != "cont" else None,
-                                        log=JOBDIR / f"{jid}.out", on_pid=lambda pid: _job_meta(jid, dict(meta, pid=pid)))
+                                        log=JOBDIR / f"{jid}.out", on_pid=lambda pid: _job_meta(jid, dict(meta, pid=pid)),
+                                        model=b.get("model") if b.get("model") in ALT_MODELS else None)
             if err and how == "cont" and not out and attempt == 0:  # 이 창의 갈래가 사라졌으면 만든 세션에서 다시 갈라 시작
                 thread = ""
                 continue
@@ -2414,6 +2419,9 @@ TRACKER_JS = r"""
       if (q === 'float') { P.side = false; FOCUS = P; return glide(P); }
       if (q === 'flip') { SIDE = SIDE === 'left' ? 'right' : 'left'; try { localStorage.setItem('wimaskside', SIDE); } catch {} return glide(P); }
       if (q === 'jump') return jumpChg();
+      if (q === 'alt') { const b = e.target.closest('[data-q]'); P.altModel = 'claude-opus-4-8'; setMode(P, P.mode);
+        P.el.querySelector('textarea').value = b.dataset.ch === '1' ? '앞 요청이 중간에 멈췄다. 이미 고친 부분은 다시 읽고 남은 것만 이어서 끝내라: ' + b.dataset.qq : b.dataset.qq;
+        b.disabled = true; return sendAsk(P); }
       if (q === 'cont') { setMode(P, 'edit'); P.el.querySelector('textarea').value = '중간에 끊긴 앞 요청을 이어서 마무리해. 이미 쓴 _raw 조사 메모와 고친 원본을 다시 읽고, 남은 절을 다 쓴 뒤 빌드까지 끝내'; return sendAsk(P); }
       if (q === 'reload') { try { sessionStorage.setItem('wimgo', JSON.stringify({a: anchor(), r: ratio()})); } catch {} savePanes(); return location.reload(); }
       if (FOCUS !== P) { FOCUS = P; layout(); } });
@@ -2490,7 +2498,7 @@ TRACKER_JS = r"""
     item.innerHTML = `<div class="tq"><i class="${mode === 'edit' ? 'ed' : ''}">${mode === 'edit' ? 'HTML 수정' : '질문'}</i>${esc(q)}</div>`
       + '<div class="tl live"><span class="sp"></span><span class="st">보냄 · 세션 여는 중</span><span class="tm">0초</span></div><div class="tls"></div><div class="ta cur"></div>';
     a.querySelector('.th').append(item); savePanes();
-    runItem(P, item, {sel: P.sel, ctx: P.ctx, head: P.head, q, mode, thread: P.thread, blk: P.sig}, false);
+    runItem(P, item, {sel: P.sel, ctx: P.ctx, head: P.head, q, mode, thread: P.thread, blk: P.sig, model: P.altModel || undefined}, false); P.altModel = null;
   }
   async function runItem(P, item, req, reattach) {
     const a = P.el, th = a.querySelector('.th'), mode = item.dataset.mode, id = item.dataset.jid;
@@ -2522,7 +2530,9 @@ TRACKER_JS = r"""
     if (fin?.changed) apply();  // 마지막 빌드가 감시 틈에 걸렸을 수 있다
     await LIVE; clearInterval(tick); ta.classList.remove('cur'); item.dataset.run = '0';
     const live = item.querySelector('.live'); live.classList.add('end'); live.querySelector('.sp')?.remove();
-    if (fin?.err && !fin.sec) { stage('실패'); ta.innerHTML = md(txt) + `<p style="color:var(--k-warn)">[실패] ${esc(fin.err)}</p>`; fillMM(ta); }
+    const sg = /safeguards flagged/.test(fin?.err || '');  // 안전장치 오탐: 사용자가 누를 때만 그 요청 하나를 다른 모델로 다시
+    if (sg) item.insertAdjacentHTML('beforeend', `<div class="ok">이 요청이 모델 안전장치에 걸려 멈췄습니다(정상 내용도 가끔 걸림).${fin?.changed ? ' 그 전까지 고친 것은 파일에 남아 있습니다.' : ''}<button type="button" data-q="alt" data-qq="${esc(item.dataset.q || '')}" data-ch="${fin?.changed ? 1 : 0}">Opus 4.8로 이 요청만 다시</button></div>`);
+    if (fin?.err && !fin.sec) { stage(sg ? '멈춤 · 안전장치' : '실패'); ta.innerHTML = md(txt) + `<p style="color:var(--k-warn)">[실패] ${esc(fin.err)}</p>`; fillMM(ta); }
     else { const half = !fin?.changed && fin?.src?.length;
       stage(fin?.changed ? (nchg ? '끝 · 화면에 반영됨' : '끝 · 파일 고침') : half ? '멈춤 · 원본만 고침(빌드 안 됨)' : mode === 'edit' ? '끝 · 파일 변화 없음' : '끝');
       if (!txt) ta.innerHTML = '';
@@ -2544,18 +2554,21 @@ TRACKER_JS = r"""
       // 새로고침 전에 돌던 요청: 같은 작업 id로 다시 붙어 이어 받는다(서버가 재시작됐어도 기록에서)
       P.el.querySelectorAll('.th > div[data-run="1"]').forEach(it => runItem(P, it, {sel: P.sel, ctx: P.ctx, head: P.head, q: it.dataset.q, mode: it.dataset.mode, thread: P.thread, blk: P.sig}, true)); }
     PANES.forEach(P => fillMM(P.el)); FOCUS = PANES.at(-1) || null; layout(); } catch {} };
+  const sgRetry = (S, sec, q) => { const b = document.createElement('button'); b.type = 'button'; b.className = 'rf'; b.style.margin = '8px 0';
+    b.textContent = '안전장치에 걸림 · Opus 4.8로 이 질문만 다시'; b.onclick = () => { b.remove(); askCard(S, q, 'claude-opus-4-8'); }; sec.append(b); };
   // 개념 카드의 '더 물어보기'도 만든 세션이 있으면 그 세션에 묻는다
-  async function askCard(S, q) {
+  async function askCard(S, q, model) {
     setBusy(S, true, '만든 세션이 답하는 중…'); setTag(S, '만든 세션에 묻는 중');
     const sec = document.createElement('section'), box = document.createElement('div');
     sec.innerHTML = `<div class="q">↳ ${esc(q)} <small>· 만든 세션</small></div><div class="tls"></div>`; box.className = 'cur'; sec.append(box); S.bd.append(sec);
     if (X === S) sec.scrollIntoView({block: 'start', behavior: 'smooth'});
     const tls = sec.querySelector('.tls'); let txt = '';
-    await askStream({k: S.k, sel: S.term, ctx: S.ctx, head: S.head, mode: 'ask', q: `개념 카드 '${S.term}'을 보다가 묻는다: ${q}`}, {
+    await askStream({k: S.k, sel: S.term, ctx: S.ctx, head: S.head, mode: 'ask', q: `개념 카드 '${S.term}'을 보다가 묻는다: ${q}`, model}, {
       reset: () => { txt = ''; tls.innerHTML = ''; box.innerHTML = ''; },
       tool: ev => tls.insertAdjacentHTML('beforeend', `<div class="tl">${esc(TOOLK[ev.name] || ev.name)} · ${esc(ev.arg || '')}</div>`),
       text: ev => { txt += ev.d; box.innerHTML = md(txt); fillMM(box); },
-      done: () => {}, err: m => { txt += `\n\n[실패] ${m}`; box.innerHTML = md(txt); } });
+      done: ev => { if (/safeguards flagged/.test(ev?.err || '')) sgRetry(S, sec, q); },
+      err: m => { txt += `\n\n[실패] ${m}`; box.innerHTML = md(txt); if (/safeguards flagged/.test(m)) sgRetry(S, sec, q); } });
     box.className = ''; S.last = (S.last ? S.last + '\n' : '') + txt; setTag(S, ''); setBusy(S, false);
   }
   try { JSON.parse(localStorage.getItem(DK) || '[]').filter(x => (x.page || x.k) === K).forEach(x => { const S = session(x); SS.push(S); if (x.st === 'run') run(S); }); } catch {}

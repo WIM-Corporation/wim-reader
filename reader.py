@@ -766,6 +766,10 @@ class Handler(BaseHTTPRequestHandler):
                 b["k"] = nfc(b["k"]).strip("/")
             if path == "/__reader/api/explain":
                 return self.explain(b)
+            if path == "/__reader/api/stop":
+                if not self.local():
+                    return self.json({"error": "이 컴퓨터에서만 됩니다"}, 403)
+                return self.json(stop_job(b.get("id")))
             if path == "/__reader/api/ask":
                 return self.ask(b)
             fn = {"/__reader/api/doc": save_doc, "/__reader/api/mark": save_mark, "/__reader/api/done": save_done}.get(path)
@@ -878,6 +882,28 @@ Handler.explain_deep = _deep_handler
 # ---------- 만든 세션에 묻기·고치기: 문서를 만든 Claude Code 세션을 이어받아(--resume --fork-session) 묻거나 HTML을 고친다 ----------
 PROJECTS = Path.home() / ".claude/projects"
 ASK_JOBS, ASK_LK, SESS_LK = {}, threading.Lock(), {}
+STOPPED = set()  # 사용자가 멈춘 작업 id: 대기 중이면 시작 안 하고, 돌고 있으면 claude 프로세스 그룹을 끝낸다
+
+
+def stop_job(jid):
+    """질문·수정 작업 하나를 멈춘다. 돌고 있는 claude를 끝내고, 줄 서 있던 요청은 시작하지 않게 한다."""
+    jid = re.sub(r"[^A-Za-z0-9_-]", "", str(jid or ""))[:64]
+    if not jid:
+        return {"error": "id"}
+    STOPPED.add(jid)
+    killed = False
+    f = JOBDIR / f"{jid}.json"
+    if f.exists():
+        try:
+            pid = json.loads(f.read_text()).get("pid")
+        except ValueError:
+            pid = None
+        if pid and _alive(pid):
+            _killpg(pid); killed = True
+        _job_meta(jid, {"stopped": True})
+    with EDIT_CV:
+        EDIT_CV.notify_all()
+    return {"ok": True, "killed": killed}
 TOOL_ARG = ("file_path", "command", "pattern", "url", "query", "path", "description", "prompt")
 
 
@@ -1171,7 +1197,11 @@ def _ask_resume(jid, push):
                                 lambda n, a: push({"e": "tool", "name": n, "arg": a}))
     stop.set()
     changed = bool(p and p.exists() and p.stat().st_mtime != m.get("mt0"))
+    if m.get("stopped") or jid in STOPPED:
+        err, out = "", out or ["(멈춤)"]
     fin = {"e": "err", "msg": err or "작업이 중간에 끊겼습니다"} if not out else {"e": "done", "changed": changed, "sec": round(time.time() - m.get("t0", time.time())), "how": m.get("how"), "err": err}
+    if m.get("stopped") or jid in STOPPED:
+        fin["stopped"] = True
     if m.get("mode") == "edit" and not changed:
         fin["src"] = _src_changed(p, m.get("t0", time.time()))
     _job_meta(jid, {"final": fin})
@@ -1196,6 +1226,8 @@ def _ask_run(b, push):
                 if not told:
                     push({"e": "queue", "n": n}); push({"e": "note", "msg": f"같은 덩어리를 고치는 요청 {n}개가 먼저 돌고 있어 끝나길 기다립니다"}); told = True
                 EDIT_CV.wait(5)
+                if b.get("_jid") in STOPPED:
+                    break
             others = list(EDIT_ACTIVE.get(folder, []))
             EDIT_ACTIVE.setdefault(folder, []).append(me)
         if told:
@@ -1234,6 +1266,12 @@ def _ask_run(b, push):
                 push({"e": "file", "t": last})
         if p and mode == "edit":
             threading.Thread(target=watch, daemon=True).start()
+        if b.get("_jid") in STOPPED:  # 줄 서 있다가 멈춘 요청은 시작하지 않는다
+            fin = {"e": "done", "stopped": True, "changed": False, "sec": round(time.time() - t0), "how": "", "err": ""}
+            stop.set()
+            if b.get("_jid"):
+                _job_meta(b["_jid"], {"final": fin})
+            return push(fin)
         for attempt in range(2):
             cwd = (info or {}).get("cwd") or str(ROOT)
             if thread and (PROJECTS / _slug(cwd) / f"{thread}.jsonl").exists():
@@ -1248,7 +1286,7 @@ def _ask_run(b, push):
             sid, out, err = session_run(res + tools, prompt, cwd, lambda t: push({"e": "text", "d": t}),
                                         lambda n, a: push({"e": "tool", "name": n, "arg": a}), timeout=3600 if mode == "edit" else 1800,
                                         on_init=(lambda x: push({"e": "thread", "sid": x})) if how != "cont" else None,
-                                        log=JOBDIR / f"{jid}.out", on_pid=lambda pid: _job_meta(jid, dict(meta, pid=pid)),
+                                        log=JOBDIR / f"{jid}.out", on_pid=lambda pid: (_job_meta(jid, dict(meta, pid=pid)), jid in STOPPED and _killpg(pid)),
                                         model=b.get("model") if b.get("model") in ALT_MODELS else None)
             if err and how == "cont" and not out and attempt == 0:  # 이 창의 갈래가 사라졌으면 만든 세션에서 다시 갈라 시작
                 thread = ""
@@ -1261,6 +1299,8 @@ def _ask_run(b, push):
         stop.set()
         changed = bool(p and p.exists() and p.stat().st_mtime != mt0)
         fin = {"e": "err", "msg": err} if err and not out else {"e": "done", "changed": changed, "sec": round(time.time() - t0), "how": how, "err": err}
+        if b.get("_jid") in STOPPED:
+            fin = {"e": "done", "stopped": True, "changed": changed, "sec": round(time.time() - t0), "how": how, "err": ""}
         if mode == "edit" and not changed:
             fin["src"] = _src_changed(p, t0)
         if b.get("_jid"):
@@ -1733,6 +1773,8 @@ TRACKER_JS = r"""
     .ask .tq{margin:12px 0 4px;font-weight:700;font-size:14px;line-height:1.5}
     .ask .tq i{font-style:normal;font-size:11px;padding:1px 7px;border-radius:6px;background:var(--k-acc-soft);color:var(--k-acc);margin-right:6px;vertical-align:1px}
     .ask .tq i.ed{background:color-mix(in srgb,var(--k-warn) 16%,transparent);color:var(--k-warn)}
+    .ask .live .stop{margin-left:auto;flex:none;font:600 11.5px/1 system-ui;color:var(--k-warn);background:none;border:1px solid var(--k-warn);border-radius:6px;padding:2px 7px;cursor:pointer}
+    .ask .live.end .stop{display:none}.ask .live{display:flex;gap:6px;align-items:center}
     .ask .tl,.card .tl{font:11.5px/1.5 ui-monospace,Menlo,monospace;color:var(--k-muted);margin:1px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
     .ask .ta *{font-size:14.5px;line-height:1.65}.ask .ta p{margin:6px 0}.ask .ta ul,.ask .ta ol{margin:4px 0 8px;padding-left:1.3em}
     .ask .ta h2{font-size:15px;margin:10px 0 4px}.ask .ta h2 .n{display:none}.ask .ta code{font-family:ui-monospace,Menlo,monospace;font-size:13px;background:var(--k-box);padding:1px 4px;border-radius:4px}
@@ -2419,6 +2461,8 @@ TRACKER_JS = r"""
       if (q === 'float') { P.side = false; FOCUS = P; return glide(P); }
       if (q === 'flip') { SIDE = SIDE === 'left' ? 'right' : 'left'; try { localStorage.setItem('wimaskside', SIDE); } catch {} return glide(P); }
       if (q === 'jump') return jumpChg();
+      if (q === 'stop') { const it = e.target.closest('[data-jid]'), b = e.target.closest('button'); if (!it || b.disabled) return;
+        b.disabled = true; b.textContent = '멈추는 중…'; fetch(API + 'stop', {method: 'POST', body: JSON.stringify({id: it.dataset.jid})}).catch(() => {}); return; }
       if (q === 'alt') { const b = e.target.closest('[data-q]'); P.altModel = 'claude-opus-4-8'; setMode(P, P.mode);
         P.el.querySelector('textarea').value = b.dataset.ch === '1' ? '앞 요청이 중간에 멈췄다. 이미 고친 부분은 다시 읽고 남은 것만 이어서 끝내라: ' + b.dataset.qq : b.dataset.qq;
         b.disabled = true; return sendAsk(P); }
@@ -2496,7 +2540,7 @@ TRACKER_JS = r"""
     if (mode === 'edit' && !BASE) { try { BASE = await loadFile(); } catch {} }
     const item = document.createElement('div'); Object.assign(item.dataset, {jid: id, mode, q, run: '1'});
     item.innerHTML = `<div class="tq"><i class="${mode === 'edit' ? 'ed' : ''}">${mode === 'edit' ? 'HTML 수정' : '질문'}</i>${esc(q)}</div>`
-      + '<div class="tl live"><span class="sp"></span><span class="st">보냄 · 세션 여는 중</span><span class="tm">0초</span></div><div class="tls"></div><div class="ta cur"></div>';
+      + '<div class="tl live"><span class="sp"></span><span class="st">보냄 · 세션 여는 중</span><span class="tm">0초</span><button type="button" class="stop" data-q="stop" title="이 요청을 멈춘다(그 전까지 고친 것은 남는다)">■ 멈춤</button></div><div class="tls"></div><div class="ta cur"></div>';
     a.querySelector('.th').append(item); savePanes();
     runItem(P, item, {sel: P.sel, ctx: P.ctx, head: P.head, q, mode, thread: P.thread, blk: P.sig, model: P.altModel || undefined}, false); P.altModel = null;
   }
@@ -2505,6 +2549,7 @@ TRACKER_JS = r"""
     P.busy++; P.side = true; if (!reattach) FOCUS = P;
     P.work = {label: mode === 'edit' ? '만든 세션이 고치는 중…' : '만든 세션이 읽는 중…', el: P.blk}; glide(P);
     if (reattach) { item.querySelector('.ok')?.remove(); const lv = item.querySelector('.live'); lv.classList.remove('end');
+      if (!lv.querySelector('.stop')) lv.insertAdjacentHTML('beforeend', '<button type="button" class="stop" data-q="stop">■ 멈춤</button>');
       if (!lv.querySelector('.sp')) lv.insertAdjacentHTML('afterbegin', '<span class="sp"></span>'); item.querySelector('.ta').classList.add('cur'); }
     th.scrollTop = th.scrollHeight;
     const tls = item.querySelector('.tls'), ta = item.querySelector('.ta'), st = item.querySelector('.st'), tm = item.querySelector('.tm'), t0 = Date.now();
@@ -2530,11 +2575,12 @@ TRACKER_JS = r"""
     if (fin?.changed) apply();  // 마지막 빌드가 감시 틈에 걸렸을 수 있다
     await LIVE; clearInterval(tick); ta.classList.remove('cur'); item.dataset.run = '0';
     const live = item.querySelector('.live'); live.classList.add('end'); live.querySelector('.sp')?.remove();
+    if (fin?.stopped) { stage('멈춤 · 직접 멈춤'); item.insertAdjacentHTML('beforeend', `<div class="ok">멈췄습니다.${fin.changed ? ' 그 전까지 고친 것은 파일에 남아 있습니다(화면에도 반영됨).' : fin.src?.length ? ` 원본 ${fin.src.length}개는 고쳐졌지만 빌드 전이라 화면은 그대로입니다.` : ' 파일은 바뀌지 않았습니다.'}</div>`); }
     const sg = /safeguards flagged/.test(fin?.err || '');  // 안전장치 오탐: 사용자가 누를 때만 그 요청 하나를 다른 모델로 다시
     if (sg) item.insertAdjacentHTML('beforeend', `<div class="ok">이 요청이 모델 안전장치에 걸려 멈췄습니다(정상 내용도 가끔 걸림).${fin?.changed ? ' 그 전까지 고친 것은 파일에 남아 있습니다.' : ''}<button type="button" data-q="alt" data-qq="${esc(item.dataset.q || '')}" data-ch="${fin?.changed ? 1 : 0}">Opus 4.8로 이 요청만 다시</button></div>`);
     if (fin?.err && !fin.sec) { stage(sg ? '멈춤 · 안전장치' : '실패'); ta.innerHTML = md(txt) + `<p style="color:var(--k-warn)">[실패] ${esc(fin.err)}</p>`; fillMM(ta); }
     else { const half = !fin?.changed && fin?.src?.length;
-      stage(fin?.changed ? (nchg ? '끝 · 화면에 반영됨' : '끝 · 파일 고침') : half ? '멈춤 · 원본만 고침(빌드 안 됨)' : mode === 'edit' ? '끝 · 파일 변화 없음' : '끝');
+      stage(fin?.stopped ? '멈춤 · 직접 멈춤' : fin?.changed ? (nchg ? '끝 · 화면에 반영됨' : '끝 · 파일 고침') : half ? '멈춤 · 원본만 고침(빌드 안 됨)' : mode === 'edit' ? '끝 · 파일 변화 없음' : '끝');
       if (!txt) ta.innerHTML = '';
       if (fin?.err) item.insertAdjacentHTML('beforeend', `<p style="color:var(--k-warn)">${esc(fin.err)}</p>`);
       if (half) item.insertAdjacentHTML('beforeend', `<div class="ok">조사·원본 수정은 됐지만 빌드 전에 끝났습니다 · ${fin.src.length}개 파일<br><small>${fin.src.map(esc).join(' · ')}</small><button type="button" data-q="cont">이어서 마무리</button></div>`);

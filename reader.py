@@ -939,7 +939,7 @@ def _rg():
         exe = shutil.which("rg") or next((x for x in ("/opt/homebrew/bin/rg", "/usr/local/bin/rg", "/usr/bin/rg") if Path(x).exists()), None)
         if not exe and Path(CLAUDE).exists():
             try:
-                c = os.path.realpath(CLAUDE)
+                c = CLAUDE  # 실제 경로(…/versions/2.1.xxx)로 풀지 않는다: 링크(~/.local/bin/claude)는 업데이트 뒤에도 늘 새 버전을 가리킨다
                 if subprocess.run(["rg", "--version"], executable=c, capture_output=True, text=True, timeout=10).stdout.startswith("ripgrep"):
                     exe = c
             except (OSError, subprocess.SubprocessError):

@@ -931,7 +931,10 @@ _RG = []
 
 
 def _rg():
-    """rg 실행 파일. 없으면 Claude Code에 든 rg(claude 바이너리를 argv0=rg로)를 쓴다."""
+    """rg 실행 파일. 없으면 Claude Code에 든 rg(claude 바이너리를 argv0=rg로)를 쓴다.
+    Claude Code가 스스로 업데이트하면 예전 버전 폴더(…/claude/versions/2.1.xxx)가 지워진다. 그래서 기억해 둔 경로가 사라졌으면 다시 찾는다."""
+    if _RG and _RG[0] and not Path(_RG[0]).exists():
+        _RG.clear()
     if not _RG:
         exe = shutil.which("rg") or next((x for x in ("/opt/homebrew/bin/rg", "/usr/local/bin/rg", "/usr/bin/rg") if Path(x).exists()), None)
         if not exe and Path(CLAUDE).exists():
